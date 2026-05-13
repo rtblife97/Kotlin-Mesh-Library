@@ -1179,11 +1179,15 @@ class MeshNetworkManager(
             runCatching {
                 observeMeshMessages = networkManager?.incomingMeshMessages
                     ?.onEach {
+                        // simdo-patch: forward RX metadata captured at NetworkLayer.handle().
                         _networkEvents.emit(
                             value = NetworkEvent.MeshMessageReceived(
                                 source = it.source.address,
                                 destination = it.destination,
-                                message = it.message as MeshMessage
+                                message = it.message as MeshMessage,
+                                sequence = it.sequence,
+                                ivIndex = it.ivIndex,
+                                ttl = it.ttl,
                             )
                         )
                     }?.launchIn(scope = scope)

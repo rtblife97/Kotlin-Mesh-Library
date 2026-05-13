@@ -487,9 +487,16 @@ internal class NetworkManager internal constructor(
  * @property source      Source address from which the message was received.
  * @property destination Destination address to which the message is intended.
  * @property message     Message that was received.
+ * @property sequence    simdo-patch: 24-bit sequence number from the Network PDU.
+ * @property ivIndex     simdo-patch: 32-bit IV Index used to decrypt the Network PDU.
+ * @property ttl         simdo-patch: TTL value read from the Network PDU header.
  */
 internal data class ReceivedMessage(
     val source: MeshAddress,
     val destination: MeshAddress,
     val message: BaseMeshMessage,
+    // simdo-patch: RX metadata captured at NetworkLayer.handle() emit site (single source of truth).
+    val sequence: UInt,
+    val ivIndex: UInt,
+    val ttl: UByte,
 )

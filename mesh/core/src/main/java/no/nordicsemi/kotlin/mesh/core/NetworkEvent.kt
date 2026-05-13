@@ -24,10 +24,19 @@ sealed class NetworkEvent {
      * @property source      Address of the node that sent the message.
      * @property destination Address to which the message is destined to.
      * @property message     Mesh message that was received by the node.
+     * @property sequence    Sequence number (24-bit) read from the underlying Network PDU
+     *                       — simdo-patch: required for cloud sync idempotency.
+     * @property ivIndex     IV Index (32-bit) of the network beacon used to decrypt the PDU
+     *                       — simdo-patch: identifies the IV epoch this sequence is scoped to.
+     * @property ttl         TTL value from the Network PDU header at receipt time
+     *                       — simdo-patch: original TTL, not the residual hop count.
      */
     data class MeshMessageReceived(
         val source: Address,
         val destination: MeshAddress,
         val message: MeshMessage,
+        val sequence: UInt,
+        val ivIndex: UInt,
+        val ttl: UByte,
     ) : NetworkEvent()
 }

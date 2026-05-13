@@ -81,10 +81,14 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                 return if (networkPdu != null) {
                     logger?.i(LogCategory.NETWORK) { "$networkPdu received" }
                     networkManager.lowerTransportLayer.handle(networkPdu = networkPdu)?.let {
+                        // simdo-patch: capture sequence/ivIndex/ttl from the Network PDU.
                         ReceivedMessage(
                             source = networkPdu.source,
                             destination = networkPdu.destination,
-                            message = it
+                            message = it,
+                            sequence = networkPdu.sequence,
+                            ivIndex = networkPdu.ivIndex,
+                            ttl = networkPdu.ttl,
                         )
                     }
                 } else {
@@ -434,10 +438,14 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                     // Look for the proxy Node.
                     val proxyNode = meshNetwork.node(proxyPdu.source as UnicastAddress)
                     networkManager.proxy.handle(message = message, proxy = proxyNode)
+                    // simdo-patch: Proxy Configuration PDU also carries seq/ivIndex/ttl via NetworkPdu.
                     ReceivedMessage(
                         source = proxyPdu.source,
                         destination = proxyPdu.destination,
-                        message = message
+                        message = message,
+                        sequence = proxyPdu.sequence,
+                        ivIndex = proxyPdu.ivIndex,
+                        ttl = proxyPdu.ttl,
                     )
                 }
             }
