@@ -132,12 +132,19 @@ internal data class AccessPdu(
                 // At least 2 octets are required.
                 require(pdu.accessPdu.size >= 2) { return null }
                 val octet1 = pdu.accessPdu[1]
+                // simdo-fork (2026-05-19) — sign-extension bug fix. Byte.toUShort() 는 Kotlin 에서
+                // sign extension 수행 — 0x82 (Byte=-126) → 0xFF82 (UShort). 그 결과 LightLcModeStatus
+                // 응답 (raw=0x82 0x94 ...) 가 0xFF94 로 mis-parse 되어 client filter 매칭 실패 →
+                // 30s timeout + resend loop. SIG Mesh §3.7.3 2-octet opcode 는 unsigned 처리가 spec.
+                // fix: Byte → UByte → Int (no sign extension) → opCode UInt.
+                val o0 = octet0.toInt() and 0xFF
+                val o1 = octet1.toInt() and 0xFF
                 return AccessPdu(
                     message = null,
                     userInitiated = false,
                     source = pdu.source,
                     destination = pdu.destination,
-                    opCode = (octet0.toUShort() shl 8 or octet1.toUShort()).toUInt() and 0x0000FFFFu,
+                    opCode = ((o0 shl 8) or o1).toUInt(),
                     parameters = pdu.accessPdu.copyOfRange(
                         fromIndex = 2, toIndex = pdu.accessPdu.size
                     ),
