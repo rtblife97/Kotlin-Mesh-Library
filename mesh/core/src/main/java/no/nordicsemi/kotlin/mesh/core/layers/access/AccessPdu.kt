@@ -63,7 +63,10 @@ internal data class AccessPdu(
                     .takeIf { it.isNotEmpty() }
                     ?.let { ", parameters: 0x${parameters.toHexString(HexFormat.UpperCase)})"}
                     ?: ")"
-            )
+            ) +
+            // simdo-fork (2026-05-18) — raw accessPdu byte logging for opcode parsing 진단.
+            // LightLcModeStatus 응답이 0xFF94 로 decode 되는 root cause 추적용.
+            " [raw=0x${accessPdu.toHexString(HexFormat.UpperCase)}]"
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
