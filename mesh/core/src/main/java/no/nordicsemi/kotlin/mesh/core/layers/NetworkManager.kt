@@ -74,10 +74,19 @@ internal class NetworkManager internal constructor(
     internal var accessLayer = AccessLayer(this)
         private set
 
+    // simdo-fork (2026-05-18) — bearer setter 의 이전 collector Job cancel 추가.
+    // 원본 lib 가 setter 호출마다 awaitBearerPdus() 새 launchIn — 이전 Job cancel 없음.
+    // multiple subscriber 자체는 정상 동작하지만, KotlinMeshActivator 의 race 가 함께 발생하면
+    // orphan NetworkManager 의 collector 가 살아남아 SNB 받고 orphan ProxyFilter 에 set →
+    // active ProxyFilter.proxy 영원히 null → CannotRelay throw.
+    // 본 fix 로 같은 NetworkManager 안의 중복 collector 회피.
+    private var bearerCollectorJob: kotlinx.coroutines.Job? = null
+
     var bearer: MeshBearer? = null
         internal set(value) {
             field = value
-            awaitBearerPdus()
+            bearerCollectorJob?.cancel()
+            bearerCollectorJob = awaitBearerPdus()
         }
 
     val meshNetwork: MeshNetwork
@@ -106,8 +115,8 @@ internal class NetworkManager internal constructor(
     /**
      * Awaits and returns the mesh pdu received by the bearer.
      */
-    private fun awaitBearerPdus() {
-        bearer?.pdus
+    private fun awaitBearerPdus(): kotlinx.coroutines.Job? {
+        return bearer?.pdus
             ?.onEach {
                 runCatching { handle(incomingPdu = it.data, type = it.type) }
                     .onFailure { throwable ->
