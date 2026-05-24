@@ -395,17 +395,38 @@ class ProxyFilter internal constructor(
         scope.launch {
             onNewNetworkCreated()
             logger?.i(LogCategory.PROXY) { "New Proxy connected" }
-            manager.network?.localProvisioner?.let { provisioner ->
-                when (initializeState) {
-                    ProxyFilterSetup.AUTOMATIC -> setup(provisioner = provisioner)
-                    ProxyFilterSetup.ACCEPT_LIST -> {
-                        setType(type = ProxyFilterType.ACCEPT_LIST)
-                        add(addresses = addresses)
+            // simdo-patch (2026-05-24): 자동 setup 의 TOCTOU race 가드.
+            //
+            // 이 블록은 `manager.network` 가 non-null 임을 확인하고 진입하지만, 이어지는
+            // setType/add 가 던지는 PROXY_CONFIGURATION 송신은 `MeshNetworkManager.networkManager`
+            // (network 와 별개 필드) 를 본다. proxy GATT 연결 직후 (Secure Network Beacon 수신)
+            // 다른 코루틴 (concurrent import/clear/load — 예: provisioning 직후 자동동기 재import,
+            // Realtime CDB 변경 import) 이 그 사이에 networkManager 를 잠깐 null 로 만들면
+            // `send(ProxyConfigurationMessage)` 가 NoNetwork 를 던진다.
+            //
+            // 이는 영구 오류가 아니라 일시적 상태 — 네트워크가 다시 준비되면 다음 Secure Network
+            // Beacon 이 `updateProxyFilter` → `onNewProxyConnected` 를 재트리거한다. 따라서 여기서는
+            // 조용히 중단한다. (최후 방어선인 scope 의 CoroutineExceptionHandler 와 중복이지만,
+            // 정상 경로에서 의도된 동작임을 명시하고 로그를 debug 수준으로 유지하기 위함.)
+            runCatching {
+                manager.network?.localProvisioner?.let { provisioner ->
+                    when (initializeState) {
+                        ProxyFilterSetup.AUTOMATIC -> setup(provisioner = provisioner)
+                        ProxyFilterSetup.ACCEPT_LIST -> {
+                            setType(type = ProxyFilterType.ACCEPT_LIST)
+                            add(addresses = addresses)
+                        }
+                        ProxyFilterSetup.REJECT_LIST -> {
+                            setType(type = ProxyFilterType.REJECT_LIST)
+                            add(addresses = addresses)
+                        }
                     }
-                    ProxyFilterSetup.REJECT_LIST -> {
-                        setType(type = ProxyFilterType.REJECT_LIST)
-                        add(addresses = addresses)
-                    }
+                }
+            }.onFailure { e ->
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                logger?.d(LogCategory.PROXY) {
+                    "Proxy auto-setup aborted (network not ready yet, will retry on next " +
+                        "Secure Network Beacon): ${e::class.simpleName}: ${e.message}"
                 }
             }
         }

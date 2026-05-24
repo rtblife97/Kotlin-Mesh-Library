@@ -1,6 +1,7 @@
 package no.nordicsemi.kotlin.mesh.core
 
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -86,7 +87,30 @@ class MeshNetworkManager(
     internal val secureProperties: SecurePropertiesStorage,
     internal val ioDispatcher: CoroutineDispatcher,
 ) : Publisher {
-    internal val scope = CoroutineScope(context = SupervisorJob() + ioDispatcher)
+    // simdo-patch (2026-05-24): fire-and-forget 코루틴 (ProxyFilter.onNewProxyConnected 의
+    // scope.launch, networkManagerEvent 의 save()/clear(), observeMeshMessages 등) 가 던지는
+    // 예외를 스레드 기본 핸들러로 전파해 앱을 죽이지 않도록 격리.
+    //
+    // 배경: SupervisorJob 은 sibling 격리만 할 뿐 CoroutineExceptionHandler 를 설치하지 않는다.
+    // top-level scope.launch 에서 던진 미처리 예외는 (handler 부재 시) Thread 의 default uncaught
+    // handler 로 propagate → FATAL EXCEPTION. 대표 사례: proxy GATT 연결 직후 lib 자동
+    // setup(provisioner) 가 SetFilterType 송신 시점에 다른 코루틴 (concurrent import/clear) 이
+    // networkManager 를 null 로 바꾼 race window → MeshNetworkManager.send(ProxyConfigurationMessage)
+    // 가 NoNetwork throw → 앱 크래시 (caller 가 collect 하는 proxyFilterStateFlow 와 무관한 별
+    // 코루틴이므로 외부에서 잡을 수 없음).
+    //
+    // 본 handler 는 NoNetwork / CannotRelay 같은 transient mesh-state 예외를 로그만 남기고 삼킨다.
+    // 네트워크가 다시 준비되면 (import 완료 → 다음 Secure Network Beacon) lib 가 자동 재시도한다.
+    // CancellationException 은 정상 협조 취소이므로 무시. 그 외 예상치 못한 예외도 로그만 남기고
+    // 삼켜 앱 안정성을 최우선으로 한다 (앱이 죽는 것보다 mesh 동작 일시 실패가 낫다).
+    private val uncaughtHandler = CoroutineExceptionHandler { _, throwable ->
+        if (throwable is kotlinx.coroutines.CancellationException) return@CoroutineExceptionHandler
+        logger?.e(category = LogCategory.FOUNDATION_MODEL) {
+            "Uncaught exception in mesh scope (swallowed to prevent crash): " +
+                "${throwable::class.simpleName}: ${throwable.message}"
+        }
+    }
+    internal val scope = CoroutineScope(context = SupervisorJob() + ioDispatcher + uncaughtHandler)
     private val mutex by lazy { Mutex() }
     var networkParameters = NetworkParameters()
 
