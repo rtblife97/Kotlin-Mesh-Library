@@ -137,6 +137,20 @@ data class Node internal constructor(
             network?.updateTimestamp()
         }
 
+    /**
+     * simdo-patch (2026-05-25) — `configComplete` 의 public mutator.
+     *
+     * 상위 stack(앱)이 노드 풀 config 시퀀스(Composition Data Get → AppKey Add → Model App Bind)
+     * 를 모두 성공시킨 뒤, provisioner 측 "configured" 판단을 기록하기 위해 호출한다. lib 는
+     * config 메시지 완료를 자동 감지해 `configComplete` 를 set 하지 않으므로(setter internal),
+     * 명시 mutator 가 필요. nRF 레퍼런스 앱도 setup 시퀀스 마지막에 동일하게 직접 set 한다.
+     *
+     * 호출 후 `MeshNetworkManager.save()` 로 persist + `NetworkUpdated` emit 권장.
+     */
+    fun markConfigComplete(complete: Boolean = true) {
+        configComplete = complete
+    }
+
     val networkKeys: List<NetworkKey>
         get() = network?.networkKeys?.knownTo(node = this) ?: emptyList()
 

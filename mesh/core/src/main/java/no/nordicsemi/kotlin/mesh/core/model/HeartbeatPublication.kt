@@ -4,6 +4,7 @@ package no.nordicsemi.kotlin.mesh.core.model
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import no.nordicsemi.kotlin.mesh.core.model.serialization.HeartbeatFeaturesSerializer
 import no.nordicsemi.kotlin.mesh.core.messages.foundation.configuration.ConfigHeartbeatPublicationSet
 import no.nordicsemi.kotlin.mesh.core.messages.foundation.configuration.ConfigHeartbeatPublicationStatus
 import kotlin.math.log2
@@ -50,6 +51,7 @@ data class HeartbeatPublication internal constructor(
     val period: UShort,
     val ttl: UByte,
     val index: KeyIndex,
+    @Serializable(with = HeartbeatFeaturesSerializer::class)
     val features: List<Feature>,
 ) {
 
