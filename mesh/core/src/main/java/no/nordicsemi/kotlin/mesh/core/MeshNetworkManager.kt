@@ -197,6 +197,90 @@ class MeshNetworkManager(
         }
 
     /**
+     * Re-attaches the native foundation [ModelEventHandler]s to the **local Provisioner's node**
+     * (the exact collection that [no.nordicsemi.kotlin.mesh.core.layers.access.AccessLayer.handle]
+     * iterates when decoding a Device-Key encrypted Access PDU, i.e.
+     * `network.localProvisioner.node.elements`).
+     *
+     * ## Why this exists (simdo, 2026-05-26)
+     *
+     * [Model.eventHandler] is annotated `@Transient`, so it is **not preserved** when the network
+     * is serialized/deserialized ([load]/[import]). After a load the Provisioner's node still has
+     * its foundation Models (Config Server/Client, Health, SAR, Private Beacon, Remote Provisioning,
+     * Scene, Firmware) in its primary Element — but every `eventHandler` is `null`.
+     *
+     * The [localElements] setter is the only place that attaches these handlers, and it is **not**
+     * re-run automatically after a load. Worse, the setter targets `network._localElements` (a
+     * separate `@Transient` field whose post-deserialization value is the default
+     * `[Element(MAIN)]`), which is a **different collection** from the node's elements. Building a
+     * throwaway Element and pushing it through the setter also rebuilds the node's primary Element
+     * from scratch, discarding any non-foundation Models the node may legitimately hold.
+     *
+     * When the foundation handlers are `null`, `AccessLayer.handle` skips every Model in the
+     * Device-Key branch and returns `UnknownMessage`, which causes every Configuration response
+     * (e.g. Config Composition Data Status, opcode 0x02) to be rejected as an unexpected response
+     * type.
+     *
+     * ## What this does
+     *
+     * Operates **in place** on the local node's primary Element: strips the library-managed
+     * foundation Models ([Element.removePrimaryElementModels]) and re-inserts them with fresh
+     * handlers ([Element.addPrimaryElementModels]) — exactly the same handler set the [localElements]
+     * setter installs — then wires each handler's `meshNetwork` / `model` / `publisher`. Vendor and
+     * Generic Models on the Element are preserved (removePrimaryElementModels only strips Health,
+     * Scene Client and Device-Key Models). Finally, [localElements] is re-pointed at the node's
+     * elements so the two collections converge.
+     *
+     * Idempotent and cheap: if the primary Element's Config Server already has a non-null handler
+     * this is a no-op, so it is safe to call before each Configuration exchange.
+     *
+     * @return true if the local node now has foundation handlers attached, false if there is no
+     *         network / local Provisioner / node.
+     */
+    fun rehydrateLocalNodeHandlers(): Boolean {
+        val network = network ?: return false
+        val node = network.localProvisioner?.node ?: return false
+        val primaryElement = node.elements.firstOrNull() ?: return false
+
+        // Fast path: handlers already attached (normal create/setup flow). No-op.
+        val configServer = primaryElement.models.firstOrNull { it.isConfigurationServer }
+        if (configServer?.eventHandler != null) return true
+
+        logger?.w(category = LogCategory.MODEL) {
+            "rehydrateLocalNodeHandlers: foundation handlers are null on local node " +
+                    "${node.primaryUnicastAddress} — re-attaching in place " +
+                    "(deserialized @Transient eventHandler loss)"
+        }
+
+        // Re-attach the library-managed foundation Models + handlers, in place, on the node's
+        // primary Element. Reuses the exact same logic the localElements setter uses.
+        primaryElement.removePrimaryElementModels()
+        primaryElement.addPrimaryElementModels(
+            triggerAttentionTimer = { _attentionTimer.tryEmit(value = it) },
+            logger = logger
+        )
+
+        // Wire the handler dependencies for every Model on every Element of the node, matching the
+        // localElements setter.
+        node.elements.forEach { element ->
+            element.models.forEach { model ->
+                model.eventHandler?.let { handler ->
+                    handler.meshNetwork = network
+                    handler.model = model
+                    handler.publisher = this
+                }
+            }
+        }
+
+        // Converge the two collections: point _localElements at the node's elements so that
+        // AccessLayer.reinitializePublishers / SceneServer iteration / future setter calls all see
+        // the handler-bearing Models.
+        network._localElements = node.elements.toMutableList()
+        networkManager?.accessLayer?.reinitializePublishers()
+        return true
+    }
+
+    /**
      * Loads the network from the storage provided by the user.
      *
      * @return true if the configuration was successfully loaded or false otherwise.
