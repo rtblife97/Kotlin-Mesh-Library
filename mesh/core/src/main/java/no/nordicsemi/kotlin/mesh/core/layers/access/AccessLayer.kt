@@ -723,6 +723,13 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                     } timed out"
                 }
                 scope.launch {
+                    // simdo fork (2026-06-04, mode2 P0): timeout 시 해당 메시지의 reliable
+                    // context 만 제거한다. 바로 위 cancel(handle) 이 source/responseOpCode/
+                    // destination 매칭으로 이 한 건만 surgical removeAt+invalidate (cancel():436)
+                    // 하므로 그것으로 충분하다. 종전 `reliableMessageContexts.clear()` 는 cancel
+                    // 이후에 오는 **전 노드 공유 리스트 전역 쓸기** 로, 직렬에선 무해(in-flight
+                    // 1건)했으나 병렬 config 시 한 노드의 timeout 이 형제 노드의 살아있는 await
+                    // context 까지 파괴 → false-timeout 을 유발했다. 삭제.
                     cancel(
                         handle = MessageHandle(
                             message = request,
@@ -731,7 +738,6 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                             manager = networkManager
                         )
                     )
-                    mutex.withLock { reliableMessageContexts.clear() }
                 }
             }
         )
