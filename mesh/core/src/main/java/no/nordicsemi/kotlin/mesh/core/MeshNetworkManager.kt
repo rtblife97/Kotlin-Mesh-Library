@@ -554,6 +554,24 @@ class MeshNetworkManager(
     }
 
     /**
+     * Clears the per-destination "busy" entry that [send] registers while a message is outstanding.
+     *
+     * (simdo-patch) [NetworkManager.send] only removes the outgoing-message entry on a normal
+     * return (via `.also { outgoingMessages.remove(...) }`, no `finally`). If the caller cancels
+     * the coroutine driving an acknowledged unicast send before the library's ack-timeout block
+     * returns (e.g. a bounded commissioning probe that gives up early), that entry is leaked and the
+     * next [send] to the same destination throws [no.nordicsemi.kotlin.mesh.core.exception.Busy].
+     *
+     * This explicitly removes the entry so callers can recover without waiting for the library's
+     * ack-timeout. No-op if no network is initialized or the destination was not busy.
+     *
+     * @param destination Destination address whose busy entry should be cleared.
+     */
+    suspend fun clearOutgoingMessages(destination: MeshAddress) {
+        networkManager?.clearOutgoingMessages(destination = destination)
+    }
+
+    /**
      * Encrypts the message with the Application Key and a Network Key bound to it, and sends to the
      * given [Group].
      *
