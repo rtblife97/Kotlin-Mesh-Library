@@ -511,13 +511,18 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                         model.isSubscribedTo(accessPdu.destination as PrimaryGroupAddress)
                     ) {
                         if (keySet.applicationKey.isBoundTo(model = model)) {
-                            eventHandler.onMeshMessageReceived(
-                                model = model,
-                                message = message,
-                                source = accessPdu.source,
-                                destination = accessPdu.destination.address,
-                                request = request
-                            )?.let { response ->
+                            // simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
+                            // onMeshMessageReceived 가 handleResponses 로 CDB mutable collection 을
+                            // write 하므로 cdbMutex 로 직렬화한다. reply(PDU 송신)는 lock 밖.
+                            networkManager.cdbMutex.withLock {
+                                eventHandler.onMeshMessageReceived(
+                                    model = model,
+                                    message = message,
+                                    source = accessPdu.source,
+                                    destination = accessPdu.destination.address,
+                                    request = request
+                                )
+                            }?.let { response ->
                                 networkManager.reply(
                                     origin = accessPdu.destination.address,
                                     destination = accessPdu.source,
@@ -564,13 +569,19 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                             )
                         }"
                     }
-                    eventHandler.onMeshMessageReceived(
-                        model = model,
-                        message = message,
-                        source = accessPdu.source,
-                        destination = accessPdu.destination.address,
-                        request = request
-                    )?.let { response ->
+                    // simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
+                    // device-key 경로(Config 응답 포함)의 onMeshMessageReceived 가 handleResponses 로
+                    // CDB write 하므로 cdbMutex 로 직렬화. reply(PDU 송신)는 lock 밖,
+                    // 단 handle(message)(local node state mutation)는 다시 lock 안에서 수행.
+                    networkManager.cdbMutex.withLock {
+                        eventHandler.onMeshMessageReceived(
+                            model = model,
+                            message = message,
+                            source = accessPdu.source,
+                            destination = accessPdu.destination.address,
+                            request = request
+                        )
+                    }?.let { response ->
                         networkManager.reply(
                             origin = accessPdu.destination.address,
                             destination = accessPdu.source,
@@ -579,7 +590,9 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                             keySet = keySet
                         )
                         // Some Config Messages require special handling.
-                        handle(message = message)
+                        networkManager.cdbMutex.withLock {
+                            handle(message = message)
+                        }
                     }
                     networkManager.emitNetworkManagerEvent(event = NetworkManagerEvent.OnNetworkChanged)
                 } else {

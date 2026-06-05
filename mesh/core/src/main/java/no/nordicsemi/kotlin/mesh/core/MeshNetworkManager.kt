@@ -304,10 +304,29 @@ class MeshNetworkManager(
      */
     @OptIn(ExperimentalTime::class, ExperimentalUuidApi::class)
     suspend fun save() {
-        export()?.let {
+        // simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
+        // export()=serialize 트래버설이 CDB mutable collection 을 순회한다.
+        // 병렬 config RX 가 동시에 write 중이면 CME → cdbMutex 로 트래버설을 직렬화.
+        // (cdbMutex 는 NetworkManager 소유; networkManager 미초기화 시 직렬 경로라 그냥 export.)
+        withCdbLock { export() }?.let {
             mutex.withLock { storage.save(network = it) }
             _networkEvents.emit(value = NetworkEvent.NetworkUpdated)
         }
+    }
+
+    /**
+     * Runs [block] holding the CDB mutation lock so that in-memory CDB writes
+     * (config response handling) and read traversals (export/serialize) are serialized.
+     *
+     * simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
+     *
+     * 앱(sdkbridge)이 provision 직후 `network.add(node)` / `save()` 같은 CDB write/traversal 을
+     * lib 의 인바운드 RX 직렬화(AccessLayer.cdbMutex)와 같은 lock 위에서 수행하도록 노출한다.
+     * networkManager 가 아직 없으면 lock 없이 block 을 그대로 실행한다(네트워크 미로드=경합 불가).
+     */
+    suspend fun <T> withCdbLock(block: suspend () -> T): T {
+        val nm = networkManager ?: return block()
+        return nm.cdbMutex.withLock { block() }
     }
 
     /**

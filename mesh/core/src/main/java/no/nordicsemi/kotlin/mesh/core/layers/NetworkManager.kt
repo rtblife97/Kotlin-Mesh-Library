@@ -96,6 +96,16 @@ internal class NetworkManager internal constructor(
         get() = manager.networkParameters
     private val mutex = Mutex()
 
+    // simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
+    // 병렬 config (mode2) 에서 N 노드의 ConfigStatus 응답이 멀티스레드(Dispatchers.Default)로
+    // 동시에 RX 되면, handleResponses 가 같은 MeshNetwork 의 _appKeys/_subscribe/_groups 등
+    // mutable collection 에 동시 write → ConcurrentModificationException + lost update.
+    // 동시에 export()/serialize 트래버설이 같은 collection 을 순회하면 CME.
+    // cdbMutex 는 순수 in-memory CDB write/traversal 만 직렬화한다.
+    // **주의**: send / RTT 대기 / reply (PDU 송신) 는 이 lock 밖에 둔다 → throughput(병렬 in-flight) 보존.
+    // 기존 mutex(:97) 는 reliableMessageContexts/outgoingMessages 보호 전용이라 별개로 유지.
+    internal val cdbMutex = Mutex()
+
     private var outgoingMessages = mutableSetOf<MeshAddress>()
 
     private val _incomingProxyMessages = MutableSharedFlow<ReceivedMessage>()
