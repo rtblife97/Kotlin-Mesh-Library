@@ -44,12 +44,14 @@ import java.util.concurrent.atomic.AtomicReference
  * 둘 다 사라진다. Fork-3 의 lock 적용 지점(AccessLayer RX + serialize)이 같은 단일 Mutex 를
  * 공유한다는 불변을 가드한다.
  */
+@OptIn(kotlin.uuid.ExperimentalUuidApi::class)
 class CdbMutationRaceTest {
 
     private companion object {
         const val WRITER_NODES = 64        // 동시 add 될 노드 수
         const val KEYS_PER_NODE = 32       // 노드당 동시 addNetKey/addAppKey 수
         const val SERIALIZE_ITERATIONS = 400
+        const val PROVISION_NODES = 64     // P4: 동시 "provision add" 될 노드 수
     }
 
     /** handleResponses 와 동일한 internal mutator 로 노드에 키를 적재 (병렬). */
@@ -178,6 +180,101 @@ class CdbMutationRaceTest {
                 null,
                 failure,
             )
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // P4 (simdo-fork, 2026-06-06) — 병렬 provisioning add race.
+    // ProvisioningManager.kt:266 의 `meshNetwork.withCdbLock { remove(uuid); add(node) }` 가
+    // config-RX 와 같은 lock(MeshNetwork.cdbMutex, P4 hoist)으로 직렬화되는지 가드한다. 위 테스트는
+    // 로컬 Mutex 로 cdbMutex 를 *모사*했지만, 본 테스트는 **실제 network.withCdbLock / cdbMutex** 를
+    // 직접 행사한다(hoisted lock 자체의 회귀 가드).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * ProvisioningManager 의 add 경로를 모사 — N 노드를 동시에 remove(uuid)+add(node) 한다.
+     * `useRealCdbLock=true` 면 실제 `network.withCdbLock` 으로 감싸고(=fix), false 면 raw(=재현).
+     * reader 는 serialize 트래버설로 동시 순회한다.
+     */
+    private fun runProvisionRace(useRealCdbLock: Boolean): Throwable? {
+        val network = MeshNetwork(name = "Provision Race Network").apply {
+            add(name = "Primary Network Key", index = 0u)
+        }
+        val failure = AtomicReference<Throwable?>(null)
+
+        runBlocking {
+            try {
+                coroutineScope {
+                    val writers = (0 until PROVISION_NODES).map { n ->
+                        async(Dispatchers.Default) {
+                            val node = Node(name = "Node $n", address = (1 + n), elements = 1)
+                            // ProvisioningManager 동형: remove(uuid) 후 add(node).
+                            val provisionAdd = suspend {
+                                network.remove(uuid = node.uuid)
+                                network.add(node = node)
+                            }
+                            if (useRealCdbLock) network.withCdbLock { provisionAdd() }
+                            else provisionAdd()
+                        }
+                    }
+                    val readers = (0 until 4).map {
+                        async(Dispatchers.Default) {
+                            repeat(SERIALIZE_ITERATIONS) {
+                                runCatching {
+                                    val ser = {
+                                        MeshNetworkSerializer.serialize(
+                                            network = network,
+                                            configuration = NetworkConfiguration.Full,
+                                        )
+                                    }
+                                    // reader 도 같은 lock 으로 직렬화(config-RX serialize 모사).
+                                    if (useRealCdbLock) network.withCdbLock { ser() } else ser()
+                                }.onFailure { failure.compareAndSet(null, it) }
+                            }
+                        }
+                    }
+                    (writers + readers).awaitAll()
+                }
+            } catch (t: Throwable) {
+                failure.compareAndSet(null, t)
+            }
+        }
+
+        // lost-update: 동시 add 된 노드가 전부 살아 있어야 한다(각 주소 unique).
+        if (failure.get() == null && network.nodes.size != PROVISION_NODES) {
+            failure.compareAndSet(
+                null,
+                AssertionError("provision lost update: nodes=${network.nodes.size} expected $PROVISION_NODES"),
+            )
+        }
+        return failure.get()
+    }
+
+    /**
+     * P4 재현(음성 대조군): 실제 cdbMutex 없이 N 노드 동시 provision-add + serialize → CME/lost-update.
+     * mutation-check 역할도 겸한다 — `withCdbLock` 을 무력화하면(=useRealCdbLock=false) 결함이 산다.
+     */
+    @Test
+    fun `P4 - cdbMutex 없이 동시 provisioning add 면 CME 또는 lost-update`() {
+        var observed: Throwable? = null
+        repeat(10) {
+            if (observed == null) observed = runProvisionRace(useRealCdbLock = false)
+        }
+        assertTrue(
+            "lock 없는 동시 provisioning add+serialize 는 CME/lost-update 를 일으켜야 한다. 실제: $observed",
+            observed != null,
+        )
+    }
+
+    /**
+     * P4 fix: 실제 `network.withCdbLock`(= MeshNetwork.cdbMutex, config-RX 가 위임하는 그 lock)으로
+     * provisioning add 와 serialize 를 직렬화하면 여러 라운드 반복해도 CME/lost-update 0.
+     */
+    @Test
+    fun `P4 - 실제 withCdbLock 으로 동시 provisioning add 직렬화하면 결함 0`() {
+        repeat(10) { round ->
+            val failure = runProvisionRace(useRealCdbLock = true)
+            assertEquals("round=$round 에서 withCdbLock 직렬화에도 결함: $failure", null, failure)
         }
     }
 

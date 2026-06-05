@@ -256,8 +256,17 @@ class ProvisioningManager(
                     assignedNetworkKey = configuration.networkKey,
                     security = provisioningData.security
                 )
-                meshNetwork.remove(uuid = node.uuid)
-                meshNetwork.add(node = node)
+                // simdo-fork (2026-06-06) — Fork-3 확장(P4: 병렬 provisioning CDB mutation race).
+                // 병렬 provision 시 N 개 ProvisioningManager 가 동시에 같은 MeshNetwork 의 _nodes(ArrayList)에
+                // remove/add 하면 CME + lost-update. 또한 config-status RX(AccessLayer)·export(serialize)
+                // 트래버설과도 같은 collection 을 건드린다. MeshNetwork.cdbMutex(= config-RX 가 위임하는
+                // 그 lock, P4 hoist)로 remove+add 를 직렬화한다. send/PDU 송신은 이 lock 밖이라(여기는
+                // 순수 in-memory CDB write) throughput 영향 없음. Mutex 비재진입 — 이 블록 내부에서 다른
+                // withCdbLock 재진입 없음(remove/add 는 MeshNetwork 자체 메서드, lock 미인지).
+                meshNetwork.withCdbLock {
+                    meshNetwork.remove(uuid = node.uuid)
+                    meshNetwork.add(node = node)
+                }
             }
 
         } catch (error: RemoteError) {

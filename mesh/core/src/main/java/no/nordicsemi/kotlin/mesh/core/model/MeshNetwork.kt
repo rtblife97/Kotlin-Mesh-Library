@@ -2,6 +2,7 @@
 
 package no.nordicsemi.kotlin.mesh.core.model
 
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
@@ -141,6 +142,36 @@ data class MeshNetwork internal constructor(
     @Transient
     var ivIndex = IvIndex()
         internal set
+
+    /**
+     * simdo-fork (2026-06-06) — Fork-3 확장(P4: 병렬 provisioning CDB mutation race).
+     *
+     * 이 network 의 mutable CDB collection(`_nodes`/`_netKeys`/`_appKeys`/`_groups`/model subscribe 등)에
+     * 대한 **모든** in-memory write/traversal 을 직렬화하는 canonical lock. Fork-3(2026-06-05)이
+     * [no.nordicsemi.kotlin.mesh.core.layers.NetworkManager] 에 두었던 `cdbMutex` 를 mutated 대상인
+     * MeshNetwork 로 hoist 한다 — 그래야 config-status RX 직렬화(NetworkManager 가 본 lock 에 위임)와
+     * **병렬 provisioning 의 `add(node)`**([no.nordicsemi.kotlin.mesh.provisioning.ProvisioningManager])이
+     * **같은 lock 인스턴스**를 공유한다. (provisioning 모듈은 NetworkManager 를 모르지만 MeshNetwork 는
+     * 안다 → 결합 없이 공유 성립.)
+     *
+     * @Transient — 직렬화 제외. 네트워크 swap(import) 시 새 MeshNetwork 가 자기 lock 을 갖는다(다른
+     * CDB = 다른 lock = 정확).
+     *
+     * **주의**(Fork-3 불변식 보존): send / RTT 대기 / reply(PDU 송신) 는 이 lock 밖에 둔다 →
+     * 병렬 in-flight throughput 보존. 본 lock 은 순수 in-memory CDB write/traversal 만 감싼다.
+     * kotlinx Mutex 는 비재진입이므로 lock 안에서 다시 [withCdbLock] 류를 호출하지 않는다.
+     */
+    // public: mesh:provisioning 모듈(별 Gradle 모듈)의 ProvisioningManager 가 add(node) 를 이 lock 으로
+    // 감싸야 하는데 internal 은 모듈 경계를 못 넘는다. add(node)/remove(uuid) 가 public 인 것과 정합.
+    @Transient
+    val cdbMutex: kotlinx.coroutines.sync.Mutex = kotlinx.coroutines.sync.Mutex()
+
+    /**
+     * [block] 을 [cdbMutex] 아래에서 실행 — CDB write/traversal 직렬화 진입점.
+     * provisioning add 처럼 MeshNetwork 만 아는 호출부가 NetworkManager 우회 없이 같은 lock 을 쓰게 한다.
+     */
+    suspend fun <T> withCdbLock(block: suspend () -> T): T =
+        cdbMutex.withLock { block() }
 
     val localProvisioner: Provisioner?
         get() = _provisioners.firstOrNull()
