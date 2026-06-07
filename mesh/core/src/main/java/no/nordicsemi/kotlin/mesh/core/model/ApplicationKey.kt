@@ -110,9 +110,10 @@ data class ApplicationKey internal constructor(
      * Returns whether the application key is added to any nodes in the network.
      * A key that is in use cannot be removed until it has been removed from all the nodes.
      */
+    // simdo-fork (2026-06-08, Phase 3) — `_nodes` private 봉인. 부활 시 guarded 스냅샷([MeshNetwork.nodes]) 경유.
     /*fun isInUse(): Boolean = network?.run {
         // The application key in used when it is known by any of the nodes in the network.
-        _nodes.any { node ->
+        nodes.any { node ->
             node.appKeys.any { nodeKey ->
                 nodeKey.index == index
             }

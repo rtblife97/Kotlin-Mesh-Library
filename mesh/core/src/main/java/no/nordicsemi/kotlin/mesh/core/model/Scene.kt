@@ -97,14 +97,16 @@ data class Scene internal constructor(
     /**
      * Returns a list of nodes registered to a given scene address.
      */
-    fun nodes(): List<Node> = network?._nodes?.filter { node ->
+    // simdo-fork (2026-06-08, Phase 3) — `_nodes` private 봉인. guarded 스냅샷 getter([MeshNetwork.nodes]) 경유.
+    fun nodes(): List<Node> = network?.nodes?.filter { node ->
         node.elements.any { element -> _addresses.contains(element.unicastAddress) }
     } ?: listOf()
 
     /**
      * Returns a list of elements registered to a given scene address.
      */
-    fun elements(): List<Element> = network?._nodes?.flatMap { node ->
+    // simdo-fork (2026-06-08, Phase 3) — `_nodes` private 봉인. guarded 스냅샷 getter([MeshNetwork.nodes]) 경유.
+    fun elements(): List<Element> = network?.nodes?.flatMap { node ->
         node.elements.filter { element -> _addresses.contains(element.unicastAddress) }
     } ?: listOf()
 

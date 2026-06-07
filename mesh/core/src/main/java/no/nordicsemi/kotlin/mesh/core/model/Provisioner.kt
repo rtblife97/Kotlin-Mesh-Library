@@ -72,8 +72,9 @@ data class Provisioner internal constructor(
     val allocatedSceneRanges: List<SceneRange>
         get() = _allocatedSceneRanges
 
+    // simdo-fork (2026-06-08, Phase 3) — `_nodes` private 봉인. guarded lookup 헬퍼([MeshNetwork.node]) 경유.
     val node: Node?
-        get() = network?._nodes?.find { it.uuid == uuid }
+        get() = network?.node(uuid)
 
     val primaryUnicastAddress: UnicastAddress?
         get() = node?.primaryUnicastAddress

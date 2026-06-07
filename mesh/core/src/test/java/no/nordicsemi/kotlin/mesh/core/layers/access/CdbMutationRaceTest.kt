@@ -418,54 +418,32 @@ class CdbMutationRaceTest {
     }
 
     /**
-     * 음성 대조군(mutation-check) — withNodesLock 를 우회해 backing `_nodes` 를 **직접** raw 순회하면
-     * (= fix 전 serialize 가 backing list 를 raw iterate 하던 동작), 동시 구조 변이와 CME 가 난다.
-     * 이로써 serialize 의 withNodesLock 감싸기가 load-bearing 임을 **best-effort** 로 입증한다.
+     * 음성 대조군 — **Phase 3(2026-06-08) 이후 컴파일 타임으로 승격**.
      *
-     * ## ★CI 결정성 — race 는 비결정적(Heisenbug)이라 hard 단언 금지
+     * 종전엔 withNodesLock 를 우회해 backing `_nodes` 를 런타임에 raw 순회하며(= fix 전 serialize 동작)
+     * CME 를 best-effort 로 관측해 withNodesLock 감싸기의 필요성을 입증했다(Heisenbug → assumeTrue skip).
+     * Phase 3 에서 `_nodes` 를 `internal`→`private` 로 봉인하면서 그 raw 순회가 **test 소스셋에서도
+     * 컴파일 불가**가 됐다 — guarded 트래버설([MeshNetwork.withNodesLock]/[nodes] 스냅샷) 외의 모든
+     * 경로를 타입 시스템이 거부한다. serialize 도 [MeshNetwork.rewireAfterDeserialize] /
+     * [MeshNetwork.withNodesLock] 안에서만 `_nodes` 에 닿으므로 단일 guardian(nodesMonitor)이 강제된다.
      *
-     * CME 발생은 타이밍·코어수·JIT 의존이라 CI 환경에선 그 반복 윈도우에 안 날 수 있다. 따라서
-     * 여러 라운드 best-effort 시도 → 한 번이라도 CME 관측 시 통과, 끝까지 안 나면 [assumeTrue] 로
-     * skip(fail 아님). withNodesLock 감싸기의 실제 효력은 결정적 positive 테스트
-     * (`dual-lock - cdbMutex 없는 add_remove 와 cdbMutex 없는 serialize 동시도 CME 0`)가 담당한다.
+     * 본 테스트는 그 사실을 결정적으로 문서화한다: withNodesLock 가 실제로 [nodes] 스냅샷과 동일한
+     * monitor 아래에서 일관된 뷰를 반환하는지(= consumer 가 닿을 수 있는 guarded 경로의 동작 보존).
      */
     @Test
-    fun `dual-lock - withNodesLock 우회한 raw _nodes 순회는 CME 를 일으킨다(필요성 입증, best-effort)`() {
-        var observed: Throwable? = null
-        repeat(20) {
-            if (observed != null) return@repeat
-            val network = MeshNetwork(name = "Dual Lock Negative").apply {
-                add(name = "Primary Network Key", index = 0u)
-            }
-            runBlocking {
-                runCatching {
-                    coroutineScope {
-                        val writers = (0 until DUAL_WRITER_NODES).map { n ->
-                            async(Dispatchers.Default) {
-                                network.add(node = Node(name = "Node $n", address = 1 + n, elements = 1))
-                            }
-                        }
-                        val readers = (0 until 4).map {
-                            async(Dispatchers.Default) {
-                                repeat(DUAL_SERIALIZE_ITERATIONS) {
-                                    runCatching {
-                                        // backing list 직접 raw 순회 = fix 전 serialize 의 _nodes 트래버설.
-                                        network._nodes.forEach { node -> node.uuid.hashCode() }
-                                    }.onFailure { if (observed == null) observed = it }
-                                }
-                            }
-                        }
-                        (writers + readers).awaitAll()
-                    }
-                }.onFailure { if (observed == null) observed = it }
-            }
+    fun `dual-lock - _nodes 는 private 봉인 - guarded 경로(withNodesLock_nodes)만 컴파일됨(컴파일 타임 강제)`() {
+        val network = MeshNetwork(name = "Dual Lock Sealed").apply {
+            add(name = "Primary Network Key", index = 0u)
+            add(node = Node(name = "Node 0", address = 1, elements = 1))
+            add(node = Node(name = "Node 1", address = 2, elements = 1))
         }
-        // 관측되면 가드 필요성 입증(통과). 안 나면 CI 환경차로 race window 미개방 → skip(fail 아님).
-        assumeTrue(
-            "withNodesLock 우회 raw _nodes 순회 race window 가 이 환경에서 안 열림(CME 미관측) — " +
-                "CI 결정성 위해 skip. withNodesLock 효력 검증은 positive CME-0 테스트가 담당. 실제: $observed",
-            observed is java.util.ConcurrentModificationException,
-        )
+        // guarded 경로 1 — withNodesLock(internal): monitor 아래 일관된 스냅샷 size.
+        val underLock = network.withNodesLock { network.nodes.size }
+        // guarded 경로 2 — nodes 스냅샷 getter(public). 둘 다 같은 monitor → 동일 뷰.
+        val viaSnapshot = network.nodes.size
+        assertEquals("withNodesLock 와 nodes 스냅샷은 동일 monitor 아래 동일 뷰", underLock, viaSnapshot)
+        assertEquals(2, viaSnapshot)
+        // (raw `network._nodes.forEach {}` 를 적으면 _nodes private 라 이 파일이 컴파일되지 않는다.)
     }
 
     /**

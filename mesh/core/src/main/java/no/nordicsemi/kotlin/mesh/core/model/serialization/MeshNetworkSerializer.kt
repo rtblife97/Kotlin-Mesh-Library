@@ -55,34 +55,10 @@ internal object MeshNetworkSerializer {
             ) { "Invalid version!" }
         }
         decodeFromJsonElement<MeshNetwork>(networkElement).apply {
-            // Assign network reference to access parent network within the object.
-            _networkKeys.forEach {
-                it.network = this
-            }
-            _applicationKeys.forEach {
-                it.network = this
-            }
-            _groups.forEach {
-                it.network = this
-            }
-            _scenes.forEach {
-                it.network = this
-            }
-            _provisioners.forEach {
-                it.network = this
-            }
-            _nodes.forEach { node ->
-                node.network = this
-                node.elements.forEach { element ->
-                    element.parentNode = node
-                    element.models.forEach { model ->
-                        model.parentElement = element
-                    }
-                }
-            }
-            _networkExclusions.forEach {
-                it.network = this
-            }
+            // simdo-fork (2026-06-08, Phase 3) — parent 참조 복원을 MeshNetwork.rewireAfterDeserialize() 로 이동.
+            // `_nodes` private 봉인으로 serializer 의 raw 순회가 컴파일 불가 → MeshNetwork 멤버(intra-class)로 위임.
+            // 의미 동일(network 링크/elements·models parent 재설정).
+            rewireAfterDeserialize()
         }
     }
 

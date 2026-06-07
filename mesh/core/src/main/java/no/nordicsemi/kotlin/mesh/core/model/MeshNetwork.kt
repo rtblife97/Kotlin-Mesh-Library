@@ -91,7 +91,12 @@ data class MeshNetwork internal constructor(
     @SerialName("appKeys")
     internal var _applicationKeys: MutableList<ApplicationKey> = mutableListOf(),
     @SerialName("nodes")
-    internal var _nodes: MutableList<Node> = mutableListOf(),
+    // simdo-fork (2026-06-08, Phase 3) — `_nodes` 를 internal→private 로 봉인.
+    // [nodesMonitor] 단일 guardian 무결성을 **타입 시스템(컴파일러)으로 강제**한다: 다른 파일(Group/Scene/
+    // Provisioner)에서의 raw 순회를 컴파일 에러로 차단 → guarded accessor([nodes] 스냅샷 / [node] / [withNodesLock])
+    // 경유만 허용. (intra-class 접근은 private 라도 컴파일되므로 MeshNetwork.kt 내 apply()/serialize 보조 경로는
+    // 그대로 — 이들은 deserialize/import 단일스레드 경로이며 hot writer 와 비동시.)
+    private var _nodes: MutableList<Node> = mutableListOf(),
     @SerialName("groups")
     internal var _groups: MutableList<Group> = mutableListOf(),
     @SerialName("scenes")
@@ -898,6 +903,33 @@ data class MeshNetwork internal constructor(
         synchronized(nodesMonitor) { _nodes.find { nodeIdentity.matches(it) } }
 
     /**
+     * simdo-fork (2026-06-08, Phase 3) — deserialize 직후 parent 참조 복원을 MeshNetwork 내부로 이동.
+     *
+     * 종전엔 [no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer.deserialize] 가
+     * decode 직후 `_nodes`(외 `_networkKeys`/`_groups`/… backing field)를 raw 순회하며 `node.network=this`
+     * 등 parent 링크를 재설정했다. `_nodes` 를 private 로 봉인하면 그 cross-file 순회가 컴파일되지 않으므로,
+     * 이 wiring 을 MeshNetwork 의 멤버로 끌어와 intra-class 접근(private 허용)으로 만든다. 의미 동일 —
+     * deserialize 단일스레드 경로라 lock 불필요(hot writer 와 비동시), [_nodes] 무결성도 그대로 보존.
+     */
+    internal fun rewireAfterDeserialize() {
+        _networkKeys.forEach { it.network = this }
+        _applicationKeys.forEach { it.network = this }
+        _groups.forEach { it.network = this }
+        _scenes.forEach { it.network = this }
+        _provisioners.forEach { it.network = this }
+        _nodes.forEach { node ->
+            node.network = this
+            node.elements.forEach { element ->
+                element.parentNode = node
+                element.models.forEach { model ->
+                    model.parentElement = element
+                }
+            }
+        }
+        _networkExclusions.forEach { it.network = this }
+    }
+
+    /**
      * Adds a given [Node] to the list of nodes in the mesh network.
      *
      * @param node                         Node to be added to the network.
@@ -949,16 +981,17 @@ data class MeshNetwork internal constructor(
      * @param uuid Uuid of the node to be removed.
      */
     fun remove(uuid: Uuid) {
-        // simdo-fork (2026-06-08, P6) — find + remove 를 한 nodesMonitor 블록으로 원자화한다. 종전엔 find
-        // 가 lock 밖(raw _nodes 순회 → 동시 add/serialize 와 CME)이고 remove 만 lock 안이라 find-then-remove
-        // 가 비원자였다(같은 uuid 두 remove 가 같은 노드를 동시에 보고 둘 다 remove 시도 등). 이제 _nodes
-        // 컨테이너 무결성은 nodesMonitor 단일 guardian. 후속 cascade(_scenes/_networkExclusions/network=null)
-        // 는 _nodes 와 무관한 별 컬렉션이라 lock 밖에 둔다(_nodes 무결성에 영향 없음, lock 구간 최소화).
-        val node = synchronized(nodesMonitor) {
-            _nodes.find { it.uuid == uuid }?.also { _nodes.remove(it) }
-        }
-        node
-            ?.let { node ->
+        // simdo-fork (2026-06-08, P6 + Phase 3) — find + remove + cascade 전체를 한 nodesMonitor 블록으로
+        // 원자화한다. 종전엔 find 가 lock 밖(raw _nodes 순회 → 동시 add/serialize 와 CME)이고 remove 만 lock
+        // 안이라 find-then-remove 가 비원자였다. P6 fix 가 find+remove 를 monitor 로 묶었으나, **후속 cascade
+        // (`_scenes`/`_networkExclusions` mutation)는 lock 밖**이었다. 그런데 [MeshNetworkSerializer.serialize]
+        // 는 nodesMonitor 아래에서 `_nodes` 뿐 아니라 `_scenes`/`_networkExclusions`/`_groups` 등 **모든**
+        // 직렬화 대상 컬렉션을 iterate 한다 → cascade 의 `_networkExclusions.add`/`_scenes…remove` 가 그
+        // 직렬화 순회와 동시에 돌면 `_networkExclusions`(또는 `_scenes`)에서 CME 가 났다(Phase 3 가 봉인하는
+        // nodesMonitor 단일 guardian 의 누수 윈도). cascade 도 같은 monitor 아래로 넣어 serialize 와 배타화한다
+        // (전부 짧은 in-memory 변이·non-suspend, monitor 재진입이라 deadlock 없음).
+        synchronized(nodesMonitor) {
+            _nodes.find { it.uuid == uuid }?.also { _nodes.remove(it) }?.let { node ->
                 // Remove unicast addresses of all node's elements from the scene
                 _scenes.forEach { it.remove(node.addresses) }
                 // When a Node is removed from the network, the unicast addresses that were used
@@ -970,6 +1003,7 @@ data class MeshNetwork internal constructor(
                 node.network = null
                 updateTimestamp()
             }
+        }
     }
 
     /**

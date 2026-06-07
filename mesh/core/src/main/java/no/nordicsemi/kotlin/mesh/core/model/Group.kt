@@ -71,7 +71,8 @@ data class Group(
     val isUsed: Boolean
         get() = network?.run {
             if (_groups.any { isDirectParentOf(it) }) return true
-            _nodes.any { node ->
+            // simdo-fork (2026-06-08, Phase 3) — `_nodes` private 봉인. guarded 스냅샷 getter([nodes]) 경유.
+            nodes.any { node ->
                 node.elements.any { element ->
                     element.models.any { model ->
                         model.publish?.address == address ||
@@ -142,7 +143,8 @@ data class Group(
     /**
      * Returns a list of nodes with at least one model on any element subscribed to this group.
      */
-    fun nodes(): List<Node> = network?._nodes?.filter { node ->
+    // simdo-fork (2026-06-08, Phase 3) — `_nodes` private 봉인. guarded 스냅샷 getter([MeshNetwork.nodes]) 경유.
+    fun nodes(): List<Node> = network?.nodes?.filter { node ->
         node.elements.any { element ->
             element.models.any { model ->
                 model.publish?.address == address ||
@@ -154,7 +156,8 @@ data class Group(
     /**
      * Returns a list of elements with at least one model subscribed to this group.
      */
-    fun elements(): List<Element> = network?._nodes?.flatMap { node ->
+    // simdo-fork (2026-06-08, Phase 3) — `_nodes` private 봉인. guarded 스냅샷 getter([MeshNetwork.nodes]) 경유.
+    fun elements(): List<Element> = network?.nodes?.flatMap { node ->
         node.elements.filter { element ->
             element.models.any { model ->
                 model.publish?.address == address ||

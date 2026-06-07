@@ -7,7 +7,6 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
-import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicReference
 
@@ -88,58 +87,30 @@ class NodesGetterConcurrencyTest {
     }
 
     /**
-     * 음성 대조군(mutation-check, 문서화) — 라이브 `_nodes` 를 직접 iterate(=종전 getter 동작)하면,
-     * 동시 구조 변경과 충돌해 CME 가 발생함을 **best-effort** 로 보인다. 이로써 getter 의 방어적
-     * 스냅샷이 load-bearing 임을 입증한다.
+     * 음성 대조군 — **Phase 3(2026-06-08) 이후 컴파일 타임으로 승격**.
      *
-     * ## ★CI 결정성 — race 는 본질적으로 비결정적(Heisenbug)이라 hard 단언 금지
+     * 종전엔 라이브 backing `_nodes` 를 런타임에 직접 iterate 해 CME 를 best-effort 로 관측함으로써
+     * 방어적 스냅샷의 필요성을 입증했다(Heisenbug 라 assumeTrue skip 정책). Phase 3 에서 `_nodes` 를
+     * `internal`→`private` 로 봉인하면서 **그 raw 경로가 test 소스셋에서도 컴파일 불가**가 됐다 —
+     * 즉 "가드 우회"가 더 이상 런타임 race 가 아니라 **타입 시스템이 거부하는 컴파일 에러**다.
+     * 이로써 스냅샷이 load-bearing 임을 비결정적 race 관측이 아니라 **결정적 컴파일 강제**로 입증한다.
      *
-     * CME 발생은 runner 코어수·타이밍·JIT 에 의존한다. 개발자 머신에선 거의 매번 관측되지만,
-     * CI(GitHub-hosted ubuntu, 다른 코어수/스케줄러)에선 그 반복 윈도우에 CME 가 안 터질 수 있다.
-     * 따라서 "race 가 **반드시** 난다"는 hard 게이트는 본질적으로 flaky 다.
-     *
-     * 정책: 여러 라운드 best-effort 시도 → **한 번이라도** CME 를 관측하면 통과(가드 필요성 입증).
-     * 끝까지 안 나면 [assumeTrue] 로 **skip**(fail 아님) — race window 가 그 환경에서 안 열렸을 뿐
-     * 가드가 깨진 게 아니다. 가드의 실제 동작 검증은 결정적 positive 테스트
-     * (`withCdbLock writer 와 lock 없는 nodes getter reader 가 CME 0`)가 hard 게이트로 담당한다.
+     * 본 테스트는 그 사실을 문서화하는 결정적 plumbing 가드다: consumer 가 쓸 수 있는 유일한 nodes
+     * 접근면이 방어적 스냅샷([MeshNetwork.nodes])뿐임을 확인한다. (raw `_nodes` 를 적으면 이 파일이
+     * 컴파일되지 않으므로, 회귀가 PR 단계에서 컴파일러에 의해 차단된다.)
      */
     @Test
-    fun `라이브 _nodes 직접 iterate 는 CME 를 일으킨다 - 스냅샷의 필요성 입증(best-effort)`() {
-        var observed: Throwable? = null
-        repeat(20) {
-            if (observed != null) return@repeat
-            val network = MeshNetwork(name = "Live Nodes Race").apply {
-                add(name = "Primary Network Key", index = 0u)
-            }
-            runBlocking {
-                runCatching {
-                    coroutineScope {
-                        val writers = (0 until WRITER_NODES).map { n ->
-                            async(Dispatchers.Default) {
-                                network.add(node = Node(name = "Node $n", address = 1 + n, elements = 1))
-                            }
-                        }
-                        val readers = (0 until 4).map {
-                            async(Dispatchers.Default) {
-                                repeat(READER_ITERATIONS) {
-                                    runCatching {
-                                        // 라이브 backing list 직접 iterate(종전 getter == _nodes).
-                                        network._nodes.forEach { node -> node.name.length }
-                                    }.onFailure { if (observed == null) observed = it }
-                                }
-                            }
-                        }
-                        (writers + readers).awaitAll()
-                    }
-                }.onFailure { if (observed == null) observed = it }
-            }
+    fun `_nodes 는 private 봉인 - consumer 접근면은 방어적 스냅샷뿐(컴파일 타임 강제)`() {
+        val network = MeshNetwork(name = "Sealed Nodes").apply {
+            add(name = "Primary Network Key", index = 0u)
+            add(node = Node(name = "Node 0", address = 1, elements = 1))
         }
-        // 관측되면 가드 필요성 입증(통과). 안 나면 CI 환경차로 race window 미개방 → skip(fail 아님).
-        assumeTrue(
-            "라이브 _nodes 직접 iterate race window 가 이 환경에서 열리지 않음(CME 미관측) — " +
-                "CI 결정성 위해 skip. 가드 실제 검증은 positive CME-0 테스트가 담당. 실제: $observed",
-            observed is java.util.ConcurrentModificationException,
-        )
+        // 유일하게 컴파일되는 nodes 접근면 = 방어적 스냅샷 getter. (`network._nodes` 를 적으면 컴파일 불가.)
+        val snapshot = network.nodes
+        assertEquals(1, snapshot.size)
+        // 스냅샷은 라이브 뷰가 아니다 → 후속 add 가 기존 스냅샷을 변이하지 못함(CME 면역의 근거).
+        network.add(node = Node(name = "Node 1", address = 2, elements = 1))
+        assertEquals("방어적 스냅샷은 호출 시점 고정(라이브 _nodes 미노출)", 1, snapshot.size)
     }
 
     /**
