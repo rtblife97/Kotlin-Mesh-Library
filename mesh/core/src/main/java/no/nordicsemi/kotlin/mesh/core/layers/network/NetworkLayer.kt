@@ -178,7 +178,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             }
             // If the message was sent locally, don't report Bearer closed error.
             try {
-                networkManager.bearer?.send(pdu = networkPdu.pdu, type = type)
+                // simdo-fork (2026-06-07, P6) — dst 로 라우팅. 미등록이면 default bearer.
+                networkManager.bearerFor(destination = networkPdu.destination.address)
+                    ?.send(pdu = networkPdu.pdu, type = type)
             } catch (e: Exception) {
                 // Ignore the error because the message was sent locally.
             }
@@ -186,7 +188,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             // Messages sent with TTL = 1 will only be sent locally.
             require(ttl != 1.toUByte()) { return }
             try {
-                networkManager.bearer?.send(pdu = networkPdu.pdu, type = type)
+                // simdo-fork (2026-06-07, P6) — dst 로 라우팅. 미등록(group/proxy/평상시)이면 default bearer.
+                networkManager.bearerFor(destination = networkPdu.destination.address)
+                    ?.send(pdu = networkPdu.pdu, type = type)
                     ?: throw BearerError.Closed()
             } catch (e: Exception) {
                 if (e is BearerError.Closed) {

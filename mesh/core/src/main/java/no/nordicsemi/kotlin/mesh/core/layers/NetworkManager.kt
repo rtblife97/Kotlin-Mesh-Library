@@ -86,8 +86,76 @@ internal class NetworkManager internal constructor(
         internal set(value) {
             field = value
             bearerCollectorJob?.cancel()
-            bearerCollectorJob = awaitBearerPdus()
+            bearerCollectorJob = awaitBearerPdus(bearer = value)
         }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // simdo-fork (2026-06-07, P6 M=2) — per-destination bearer registry.
+    //
+    // 배경: config 병렬화(P6)는 N 노드를 N 개의 1-hop GATT(Sub 풀 핸들)로 **동시** config 한다.
+    //   기존 lib 는 [bearer] **단일 슬롯**뿐이라 한 시점에 한 채널로만 송수신 가능 → config 가
+    //   직렬일 수밖에 없었다(app 이 매 노드 [bearer] 를 swap). 본 registry 가 유일 구조 blocker 다.
+    //
+    // 설계:
+    //   - [bearer] 는 **default bearer** 로 유지(하위호환). group/proxy-config/미등록 dst 전부 default
+    //     로 라우팅 → 평상시 측위 RX·group 제어는 회귀 0(아래 [bearerFor] 가 미등록이면 default 반환).
+    //   - [bearers] 는 dst unicast → 그 노드 1-hop bearer. config 워커가 노드별로 register/unregister.
+    //   - TX([NetworkLayer.send])는 `networkPdu.destination.address` 로 [bearerFor] lookup.
+    //     (dst 는 PDU 헤더에 이미 있음. unicast 만 라우팅 — group/virtual 은 default.)
+    //   - RX 는 dst 라우팅 불필요(SAR/ack 상관이 src/dest-keyed) → registered bearer 마다 collector
+    //     Job 을 띄워 같은 [handle] 로 fan-in. [bearer] 와 동일 처리 경로(단순 병합).
+    //
+    // 동시성 안전(feasibility 코드 study 확정): ack 상관(AccessLayer.reliableMessageContexts=List,
+    //   source/responseOpCode/destination 3-키 매칭)·SAR RX(incompleteSegments per-(src,seqZero))·
+    //   TX seq(seqMutex atomic)·UpperTransport queue(per-dest)·CDB(cdbMutex) 전부 src/dest-keyed →
+    //   N 동시 multi-destination config 트랜잭션이 cross-talk 0. registry 는 채널 라우팅만 추가한다.
+    private val bearersLock = Any()
+
+    @Volatile
+    private var _bearers: Map<Address, MeshBearer> = emptyMap()
+
+    /** dst unicast → 그 노드 1-hop bearer. 미등록 dst·group·proxy-config 는 [bearer](default) 로. */
+    val bearers: Map<Address, MeshBearer>
+        get() = _bearers
+
+    private val bearerCollectorJobs = mutableMapOf<Address, kotlinx.coroutines.Job>()
+
+    /**
+     * 주어진 dst 로 송신할 bearer 를 반환한다. registry 에 등록된 1-hop bearer 가 있으면 그것,
+     * 없으면 [bearer](default). 미등록 dst·group·proxy-config 는 자연히 default 로 떨어진다.
+     */
+    internal fun bearerFor(destination: Address): MeshBearer? =
+        _bearers[destination] ?: bearer
+
+    /**
+     * config 워커(P6)가 노드 [destination] 의 1-hop config 진입 직전 호출 — [meshBearer] 를 그 노드
+     * dst 로 등록하고 RX collector 를 띄운다. 멱등(같은 bearer 재등록 no-op). default [bearer] 는 건드리지
+     * 않는다(측위 RX·group 제어 채널 보존). 등록 후 그 dst 로 가는 TX/RX 는 registered bearer 를 탄다.
+     */
+    fun registerBearer(destination: Address, meshBearer: MeshBearer) = synchronized(bearersLock) {
+        if (_bearers[destination] === meshBearer) return@synchronized
+        // 같은 dst 에 이전 bearer 가 있었다면 그 collector 를 먼저 정리(누수 방지).
+        bearerCollectorJobs.remove(destination)?.cancel()
+        _bearers = _bearers + (destination to meshBearer)
+        bearerCollectorJobs[destination] = awaitBearerPdus(bearer = meshBearer)
+            ?: return@synchronized
+        logger?.i(LogCategory.BEARER) {
+            "Registered per-dest bearer for 0x${destination.toHexString()}"
+        }
+    }
+
+    /**
+     * config 종료 후 호출 — 노드 [destination] 의 1-hop bearer 등록 해제 + RX collector 취소.
+     * 이후 그 dst 로 가는 TX/RX 는 다시 default [bearer] 로 떨어진다. 멱등.
+     */
+    fun unregisterBearer(destination: Address) = synchronized(bearersLock) {
+        if (_bearers[destination] == null) return@synchronized
+        bearerCollectorJobs.remove(destination)?.cancel()
+        _bearers = _bearers - destination
+        logger?.i(LogCategory.BEARER) {
+            "Unregistered per-dest bearer for 0x${destination.toHexString()}"
+        }
+    }
 
     val meshNetwork: MeshNetwork
         get() = manager.network!!
@@ -130,9 +198,11 @@ internal class NetworkManager internal constructor(
     private val ioScope = CoroutineScope(context = SupervisorJob() + manager.ioDispatcher)
 
     /**
-     * Awaits and returns the mesh pdu received by the bearer.
+     * Awaits and returns the mesh pdu received by the given [bearer] and feeds it into the common
+     * [handle] path. Used for both the default [bearer] and per-destination registered bearers
+     * (P6) — RX is src/dest-keyed downstream, so multiple bearers simply fan-in.
      */
-    private fun awaitBearerPdus(): kotlinx.coroutines.Job? {
+    private fun awaitBearerPdus(bearer: MeshBearer?): kotlinx.coroutines.Job? {
         return bearer?.pdus
             ?.onEach {
                 runCatching { handle(incomingPdu = it.data, type = it.type) }

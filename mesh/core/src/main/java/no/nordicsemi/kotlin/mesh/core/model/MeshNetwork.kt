@@ -127,8 +127,23 @@ data class MeshNetwork internal constructor(
     val applicationKeys: List<ApplicationKey>
         get() = _applicationKeys
 
+    /**
+     * simdo-fork (2026-06-07, P6 M=2) — `_nodes` getter-vs-mutation race 의 non-suspend 가드.
+     *
+     * [cdbMutex] 는 suspend 코루틴 Mutex 라 일반 property getter([nodes])에서 잡을 수 없다. 한편
+     * config 병렬화에서 N 동시 완료 + 동시 provisioning `add(node)` 가 `_nodes` 를 mutate 하는 동안
+     * [nodes] getter 를 iterate 하는 consumer(앱 `MeshNodeManager` 등)가 있으면
+     * ConcurrentModificationException 이 난다([defect_meshnetwork_nodes_unsynchronized_cme_crash]).
+     *
+     * 이 monitor 는 `_nodes` 의 **구조적 변이([add]/[remove]) 와 스냅샷([nodes] getter)** 만 직렬화한다.
+     * (Node 내부 state 변이는 per-Node 객체라 무관.) suspend [cdbMutex] 보호와 직교 — cdbMutex 는
+     * 고수준 CDB write/traversal 트랜잭션, 이 monitor 는 `_nodes` 리스트 컨테이너 자체의 무결성.
+     */
+    @Transient
+    private val nodesMonitor = Any()
+
     val nodes: List<Node>
-        get() = _nodes
+        get() = synchronized(nodesMonitor) { java.util.ArrayList(_nodes) }
 
     val groups: List<Group>
         get() = _groups
@@ -890,7 +905,11 @@ data class MeshNetwork internal constructor(
         require(_networkKeys.any { it.index == node.netKeys.first().index }) {
             throw DoesNotBelongToNetwork()
         }
-        _nodes.add(node.also { it.network = this }).also { updateTimestamp() }
+        // simdo-fork (2026-06-07, P6) — 구조적 변이를 nodesMonitor 로 직렬화([nodes] 스냅샷과 atomic).
+        synchronized(nodesMonitor) {
+            _nodes.add(node.also { it.network = this })
+        }
+        updateTimestamp()
     }
 
     /**
@@ -911,7 +930,8 @@ data class MeshNetwork internal constructor(
         _nodes
             .find { it.uuid == uuid }
             ?.let { node ->
-                _nodes.remove(node)
+                // simdo-fork (2026-06-07, P6) — 구조적 변이를 nodesMonitor 로 직렬화.
+                synchronized(nodesMonitor) { _nodes.remove(node) }
                 // Remove unicast addresses of all node's elements from the scene
                 _scenes.forEach { it.remove(node.addresses) }
                 // When a Node is removed from the network, the unicast addresses that were used

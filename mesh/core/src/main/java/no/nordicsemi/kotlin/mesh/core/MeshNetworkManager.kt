@@ -146,6 +146,31 @@ class MeshNetworkManager(
             field = value
             networkManager?.bearer = value
         }
+
+    /**
+     * simdo-fork (2026-06-07, P6 M=2) — per-destination bearer registry 공개 진입점.
+     *
+     * config 병렬화(P6)에서 N 노드를 N 개 1-hop GATT 로 **동시** config 하기 위해, 노드 dst 별로
+     * 그 노드 1-hop bearer 를 등록한다. [meshBearer](default)는 건드리지 않으므로 평상시 측위 RX·group
+     * 제어 채널은 그대로다(미등록 dst 는 default 로 라우팅). [networkManager] 미초기화(network 미로드)
+     * 시엔 no-op — 등록할 채널 자체가 없는 상태.
+     *
+     * @return true = 등록 수행, false = networkManager 미초기화(활성화 전).
+     */
+    fun registerBearer(destination: Address, bearer: MeshBearer): Boolean {
+        val nm = networkManager ?: return false
+        nm.registerBearer(destination = destination, meshBearer = bearer)
+        return true
+    }
+
+    /**
+     * simdo-fork (2026-06-07, P6 M=2) — config 종료 후 노드 [destination] 의 1-hop bearer 등록 해제.
+     * 이후 그 dst 로 가는 TX/RX 는 다시 default [meshBearer] 로 떨어진다. 멱등.
+     */
+    fun unregisterBearer(destination: Address) {
+        networkManager?.unregisterBearer(destination = destination)
+    }
+
     val proxyFilter: ProxyFilter = ProxyFilter(scope = scope, manager = this)
 
     private val _attentionTimer = MutableSharedFlow<HealthAttentionTimer>()
