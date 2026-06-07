@@ -128,6 +128,15 @@ internal class NetworkManager internal constructor(
         _bearers[destination] ?: bearer
 
     /**
+     * simdo-fork (2026-06-07, P6 M=2) — [destination] 으로 가는 **per-dest 1-hop bearer 가 등록**돼
+     * 있는지. 등록돼 있으면 그 노드는 default proxy([proxyFilter.proxy]) 가 아니라 **자기 자신**(직접
+     * 1-hop GATT) 으로 도달한다 → MeshNetworkManager 의 send-전 proxy-key 가드는 default proxy 가
+     * 아니라 **목적지 노드 자신**의 netkey 인지(node.knows)를 봐야 한다. 그 분기 판정에 쓴다.
+     */
+    internal fun hasRegisteredBearer(destination: Address): Boolean =
+        _bearers.containsKey(destination)
+
+    /**
      * config 워커(P6)가 노드 [destination] 의 1-hop config 진입 직전 호출 — [meshBearer] 를 그 노드
      * dst 로 등록하고 RX collector 를 띄운다. 멱등(같은 bearer 재등록 no-op). default [bearer] 는 건드리지
      * 않는다(측위 RX·group 제어 채널 보존). 등록 후 그 dst 로 가는 TX/RX 는 registered bearer 를 탄다.

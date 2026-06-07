@@ -723,10 +723,15 @@ class MeshNetworkManager(
         }
         // Check if the Application Key is known to the Proxy Node, or the message is sent to the
         // local Node.
+        // simdo-fork (2026-06-07, P6 M=2) — registry-aware 가드. per-dest 1-hop bearer 등록 시
+        // 목적지 노드는 자기 자신으로 직접 도달 → 노드 자신의 netkey 면 충분.
+        val reachedDirectly =
+            networkManager?.hasRegisteredBearer(destination = destination.address) == true
         val selectedAppKey = applicationKey ?: model.boundApplicationKeys
             .firstOrNull { key ->
                 // Unless the message is sent locally, take only keys known to the Proxy Node.
                 node.isLocalProvisioner ||
+                        (reachedDirectly && node.knows(key = key.boundNetworkKey)) ||
                         proxyFilter.proxy?.knows(key = key.boundNetworkKey) == true
             }
         ?: run {
@@ -868,10 +873,14 @@ class MeshNetworkManager(
 
         // Check if the application Key is known to the Proxy Node, or the message is sent to the
         // local Node.
+        // simdo-fork (2026-06-07, P6 M=2) — registry-aware 가드. per-dest 1-hop bearer 등록 시
+        // 목적지 노드는 자기 자신으로 직접 도달 → 노드 자신의 netkey 면 충분.
+        val reachedDirectly = networkManager.hasRegisteredBearer(destination = destination.address)
         val selectedAppKey = applicationKey ?: model.boundApplicationKeys
             .firstOrNull { key ->
                 // Unless the message is sent locally, take only keys known to the Proxy Node.
                 node.isLocalProvisioner ||
+                        (reachedDirectly && node.knows(key = key.boundNetworkKey)) ||
                         proxyFilter.proxy?.knows(key = key.boundNetworkKey) == true
             }
         ?: run {
@@ -1037,10 +1046,16 @@ class MeshNetworkManager(
 
         // Check if the application Key is known to the Proxy Node, or the message is sent to the
         // local Node.
+        // simdo-fork (2026-06-07, P6 M=2) — registry-aware 가드. per-dest 1-hop bearer 등록 시
+        // 목적지 노드는 자기 자신으로 직접 도달 → 노드 자신의 netkey 면 충분. 자세한 설명은
+        // AcknowledgedConfigMessage send 참조.
+        val reachedDirectly = networkManager.hasRegisteredBearer(destination = destination)
         val selectedNetKey = networkKey ?: node.networkKeys
             .firstOrNull {
                 // Unless the message is sent locally, take only keys known to the Proxy Node.
-                node.isLocalProvisioner || proxyFilter.proxy?.knows(it) == true
+                node.isLocalProvisioner ||
+                        (reachedDirectly && node.knows(key = it)) ||
+                        proxyFilter.proxy?.knows(it) == true
             }
         ?: run {
             logger?.e(LogCategory.PROXY) {
@@ -1196,12 +1211,21 @@ class MeshNetworkManager(
             throw InvalidKey()
         }
 
+        // simdo-fork (2026-06-07, P6 M=2) — 이 dst 로 per-dest 1-hop bearer 가 등록돼 있으면 목적지
+        // 노드는 default proxy(proxyFilter.proxy) 가 아니라 **자기 자신**(직접 1-hop GATT)으로 도달한다.
+        // 따라서 send-전 proxy-key 가드는 default proxy 의 키 인지가 아니라 **목적지 노드 자신**이 그 키를
+        // 아는지(node.knows)를 봐야 한다. node.networkKeys 를 순회하므로 노드는 정의상 그 키를 알지만,
+        // 명시적으로 node.knows 로 판정해 의도를 분명히 한다. (registry-aware 가드)
+        val reachedDirectly = networkManager.hasRegisteredBearer(destination = destination)
         val selectedNetworkKey = networkKey ?: node.networkKeys
             .firstOrNull { key ->
                 // A key that is being deleted cannot be used to send a message.
                 (message as? ConfigNetKeyDelete)?.networkKeyIndex != key.index &&
-                        // Unless the message is sent locally, take only keys known to the Proxy Node.
-                        (node.isLocalProvisioner || proxyFilter.proxy?.knows(key = key) == true)
+                        // 1-hop 직접 도달(registry) 이면 목적지 노드 자신의 키이면 충분.
+                        // 그 외엔 default proxy 가 아는 키만(원본 동작 보존).
+                        (node.isLocalProvisioner ||
+                                (reachedDirectly && node.knows(key = key)) ||
+                                proxyFilter.proxy?.knows(key = key) == true)
             }
         ?: run {
             if (message as? ConfigNetKeyDelete != null) {

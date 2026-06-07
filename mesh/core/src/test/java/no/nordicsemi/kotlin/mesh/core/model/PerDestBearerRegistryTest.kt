@@ -1,10 +1,15 @@
 package no.nordicsemi.kotlin.mesh.core.model
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import no.nordicsemi.kotlin.mesh.core.layers.access.CannotRelay
+import no.nordicsemi.kotlin.mesh.core.messages.foundation.configuration.ConfigCompositionDataGet
+import kotlin.time.Duration.Companion.milliseconds
 import no.nordicsemi.kotlin.mesh.bearer.BearerEvent
 import no.nordicsemi.kotlin.mesh.bearer.MeshBearer
 import no.nordicsemi.kotlin.mesh.bearer.Pdu
@@ -185,5 +190,113 @@ class PerDestBearerRegistryTest {
         // import 안 함 → networkManager null.
         assertNull(mgr.networkManager)
         assertFalse("network 미로드면 false", mgr.registerBearer(nodeA, StubBearer("A")))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // P6 M=2 device 검증 실패 회귀 가드 (simdo-fork, 2026-06-07).
+    //
+    // 증상: per-dest bearer 가 registry 에 등록되고 1-hop GATT 도 연결됐는데, config send 가
+    //   "No GATT Proxy connected or no common Network Keys" → CannotRelay 로 거부됐다.
+    // root: MeshNetworkManager.send(AcknowledgedConfigMessage) 의 send-전 proxy-key 가드가
+    //   **단일 글로벌** proxyFilter.proxy 만 봤다(registry-unaware). per-dest bearer 로만 등록하고
+    //   default 슬롯(=Main proxy)을 건드리지 않으면 proxyFilter.proxy 는 그 노드를 모름 → 거부.
+    // fix: 가드를 registry-aware 로 — dst 에 registered bearer 가 있으면(=1-hop 직접 도달) default
+    //   proxy 가 아니라 **목적지 노드 자신**이 netkey 를 아는지로 판정([NetworkManager.hasRegisteredBearer]).
+
+    private val remoteNode: UShort = 0x0002u // cdb fixture: Bedroom Light Switch, netKey 0, 원격(=비-localProvisioner).
+
+    /**
+     * 핵심 회귀: per-dest bearer 등록 + proxyFilter.proxy == null 인데도 config send 가
+     * **CannotRelay 를 던지지 않는다**(가드가 노드 자신의 netkey 를 인정 → 통과). 가드 통과 후 응답
+     * 대기에서 timeout 으로 빠지는 것은 정상(StubBearer 는 송신 no-op) — CannotRelay 만 안 나오면 된다.
+     */
+    @Test
+    fun `registered bearer 면 proxy 가 null 이어도 config send 가 CannotRelay 안 던진다`() {
+        val mgr = freshNetworkManager()
+        // default 슬롯은 비워둔다(=Main proxy 없음). 종전이라면 CannotRelay 가 날 상황.
+        assertNull("proxyFilter.proxy 는 null(연결된 proxy 없음)", mgr.proxyFilter.proxy)
+
+        mgr.registerBearer(remoteNode, StubBearer("perDest-0x0002"))
+
+        runBlocking {
+            try {
+                withTimeout(300.milliseconds) {
+                    mgr.send(
+                        message = ConfigCompositionDataGet(page = 0xFFu),
+                        destination = remoteNode,
+                    )
+                }
+                // 응답 없이 반환되어도 OK — 가드는 통과했다.
+            } catch (e: CannotRelay) {
+                throw AssertionError(
+                    "registered bearer 면 가드를 통과해야 하는데 CannotRelay 가 났다(=registry-unaware 회귀)", e
+                )
+            } catch (e: TimeoutCancellationException) {
+                // 가드 통과 후 응답 대기 timeout — 기대 동작.
+            }
+        }
+    }
+
+    /**
+     * 음성 대조군: registry 가 비어 있고(=per-dest bearer 미등록) proxyFilter.proxy 도 null 이면
+     * 종전대로 CannotRelay 를 던진다(가드의 안전 동작 보존 — 채널이 정말 없을 때 빠른 실패).
+     */
+    @Test
+    fun `미등록 dst + proxy null 이면 종전대로 CannotRelay 를 던진다`() {
+        val mgr = freshNetworkManager()
+        assertNull(mgr.proxyFilter.proxy)
+        // 등록 안 함.
+
+        runBlocking {
+            var threwCannotRelay = false
+            try {
+                withTimeout(300.milliseconds) {
+                    mgr.send(
+                        message = ConfigCompositionDataGet(page = 0xFFu),
+                        destination = remoteNode,
+                    )
+                }
+            } catch (e: CannotRelay) {
+                threwCannotRelay = true
+            } catch (e: TimeoutCancellationException) {
+                // 가드를 통과해 버린 것 → 회귀.
+            }
+            assertTrue(
+                "미등록 dst + proxy null 이면 CannotRelay 가 나야 한다(가드 안전 동작 보존)",
+                threwCannotRelay
+            )
+        }
+    }
+
+    /**
+     * M=2 동시: 서로 다른 두 dst 에 각각 per-dest bearer 등록 → **둘 다** 가드를 독립적으로 통과한다
+     * (한 노드의 등록이 다른 노드 가드에 영향 0 — 동시 config 의 핵심 불변).
+     */
+    @Test
+    fun `M=2 동시 — 서로 다른 두 dst 각각 등록되면 둘 다 가드 통과한다`() {
+        val mgr = freshNetworkManager()
+        assertNull(mgr.proxyFilter.proxy)
+
+        val dst1: UShort = 0x0002u // Bedroom Light Switch
+        val dst2: UShort = 0x0004u // Bedroom Light — 둘 다 netKey 0, 원격.
+        mgr.registerBearer(dst1, StubBearer("perDest-1"))
+        mgr.registerBearer(dst2, StubBearer("perDest-2"))
+
+        for (dst in listOf(dst1, dst2)) {
+            runBlocking {
+                try {
+                    withTimeout(300.milliseconds) {
+                        mgr.send(
+                            message = ConfigCompositionDataGet(page = 0xFFu),
+                            destination = dst,
+                        )
+                    }
+                } catch (e: CannotRelay) {
+                    throw AssertionError("dst 0x${dst.toString(16)} 가드가 CannotRelay 로 막힘(동시성 회귀)", e)
+                } catch (e: TimeoutCancellationException) {
+                    // 통과 후 timeout — OK.
+                }
+            }
+        }
     }
 }
