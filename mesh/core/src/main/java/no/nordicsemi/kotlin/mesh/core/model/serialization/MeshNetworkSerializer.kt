@@ -92,12 +92,18 @@ internal object MeshNetworkSerializer {
      * @param network          MeshNetwork to be serialized.
      * @param configuration    Configuration to be applied when serializing.
      */
+    // simdo-fork (2026-06-08, P6) — kotlinx 인코딩(network.apply(config) → backing `_nodes` 직접 순회)을
+    // MeshNetwork.withNodesLock 으로 감싼다. autosave 스레드의 이 트래버설이 nodesMonitor-only [add]/[remove]
+    // 구조 변이와 동시에 돌면 ConcurrentModificationException 이 나므로, _nodes 컨테이너의 단일 guardian 인
+    // nodesMonitor 아래에서 직렬화한다(Partial 경로의 _nodes filter-reassign 도 같은 lock 으로 배타).
     internal fun serialize(network: MeshNetwork, configuration: NetworkConfiguration) =
-        JsonObject(content = jsonSerializer.run {
-            encodeToJsonElement(value = buildMap<String, JsonElement> {
-                put(KEY_SCHEMA, JsonPrimitive(value = schema))
-                put(KEY_ID, JsonPrimitive(value = id))
-                put(KEY_VERSION, JsonPrimitive(value = version))
-            }).jsonObject + encodeToJsonElement(network.apply(configuration)).jsonObject
-        })
+        network.withNodesLock {
+            JsonObject(content = jsonSerializer.run {
+                encodeToJsonElement(value = buildMap<String, JsonElement> {
+                    put(KEY_SCHEMA, JsonPrimitive(value = schema))
+                    put(KEY_ID, JsonPrimitive(value = id))
+                    put(KEY_VERSION, JsonPrimitive(value = version))
+                }).jsonObject + encodeToJsonElement(network.apply(configuration)).jsonObject
+            })
+        }
 }

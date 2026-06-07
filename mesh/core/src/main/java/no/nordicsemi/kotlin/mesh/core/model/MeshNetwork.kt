@@ -145,6 +145,15 @@ data class MeshNetwork internal constructor(
     val nodes: List<Node>
         get() = synchronized(nodesMonitor) { java.util.ArrayList(_nodes) }
 
+    /**
+     * simdo-fork (2026-06-08, P6) — [block] 을 [nodesMonitor] 아래에서 동기 실행한다.
+     *
+     * kotlinx 직렬화는 getter([nodes]) 가 아니라 backing `_nodes`(@SerialName("nodes")) 를 **직접**
+     * 순회하므로([nodes] 방어복사 무용), serialize 트래버설을 이 헬퍼로 감싸 [add]/[remove] 구조 변이와
+     * 상호배제한다(autosave 스레드 CME 봉인). non-suspend·동기 — 순수 in-memory 인코딩만 감싼다.
+     */
+    internal fun <T> withNodesLock(block: () -> T): T = synchronized(nodesMonitor) { block() }
+
     val groups: List<Group>
         get() = _groups
 
@@ -410,7 +419,8 @@ data class MeshNetwork internal constructor(
                 throw AddressNotInAllocatedRanges()
             }
             // No other node uses the same address?
-            require(!_nodes.any { it.containsElementWithAddress(this) }) {
+            // simdo-fork (2026-06-08, P6) — _nodes raw 순회를 nodesMonitor 아래로(동시 add/remove 와 배타).
+            require(!synchronized(nodesMonitor) { _nodes.any { it.containsElementWithAddress(this) } }) {
                 throw AddressAlreadyInUse()
             }
         }
@@ -419,7 +429,10 @@ data class MeshNetwork internal constructor(
         require(!has(provisioner)) { return }
 
         // is there a node with the provisioner's uuid
-        require(_nodes.none { it.uuid == provisioner.uuid }) { throw NodeAlreadyExists() }
+        // simdo-fork (2026-06-08, P6) — _nodes raw 순회를 nodesMonitor 아래로(동시 add/remove 와 배타).
+        require(synchronized(nodesMonitor) { _nodes.none { it.uuid == provisioner.uuid } }) {
+            throw NodeAlreadyExists()
+        }
 
         // Add the provisioner's node
         address?.let { unicastAddress ->
@@ -856,8 +869,13 @@ data class MeshNetwork internal constructor(
      * @param address Mesh Address of the element.
      * @return Node if an element with the given address was found, null otherwise.
      */
+    // simdo-fork (2026-06-08, P6) — getter([nodes], 매 호출 ArrayList 전체 복사) 우회. RX hot path 가
+    // 매 inbound PDU 의 src 를 이 lookup 으로 해소하므로 O(N) alloc 압박을 없애고, 동시에 [_nodes] 직접
+    // find 를 [nodesMonitor] 아래로 넣어 [add]/[remove] 구조 변이와 상호배제한다(find 중 CME 봉인).
     fun node(address: MeshAddress) = address.takeIf { it is UnicastAddress }?.let { addr ->
-        nodes.firstOrNull { it.containsElementWithAddress(addr as UnicastAddress) }
+        synchronized(nodesMonitor) {
+            _nodes.firstOrNull { it.containsElementWithAddress(addr as UnicastAddress) }
+        }
     }
 
     /**
@@ -866,7 +884,8 @@ data class MeshNetwork internal constructor(
      * @param uuid matching Uuid.
      * @return Node
      */
-    fun node(uuid: Uuid) = nodes.find { it.uuid == uuid }
+    // simdo-fork (2026-06-08, P6) — getter 우회 + [nodesMonitor] 아래 [_nodes] 직접 find (위 [node] 참조).
+    fun node(uuid: Uuid) = synchronized(nodesMonitor) { _nodes.find { it.uuid == uuid } }
 
     /**
      * Returns the node with the given node identity.
@@ -874,7 +893,9 @@ data class MeshNetwork internal constructor(
      * @param nodeIdentity Node identity.
      * @return Node or null otherwise.
      */
-    fun node(nodeIdentity: NodeIdentity) = nodes.find { nodeIdentity.matches(it) }
+    // simdo-fork (2026-06-08, P6) — getter 우회 + [nodesMonitor] 아래 [_nodes] 직접 find (위 [node] 참조).
+    fun node(nodeIdentity: NodeIdentity) =
+        synchronized(nodesMonitor) { _nodes.find { nodeIdentity.matches(it) } }
 
     /**
      * Adds a given [Node] to the list of nodes in the mesh network.
@@ -892,7 +913,11 @@ data class MeshNetwork internal constructor(
         NoNetworkKeysAdded::class,
         DoesNotBelongToNetwork::class
     )
-    fun add(node: Node) {
+    fun add(node: Node) = synchronized(nodesMonitor) {
+        // simdo-fork (2026-06-08, P6) — precheck(node()/isAddressAvailable 가 _nodes 를 raw iterate)부터
+        // insert·updateTimestamp 까지 **전체**를 nodesMonitor 로 묶는다. 종전엔 insert(:910)만 monitor
+        // 라 precheck 의 _nodes 순회가 동시 remove/serialize 와 CME 났고, find-then-add 도 비원자였다.
+        // 내부 node()/isAddressAvailable 도 nodesMonitor 를 잡지만 JVM monitor 는 재진입이라 deadlock 없음.
         // Ensure the node does not exist already.
         require(node(uuid = node.uuid) == null) { throw NodeAlreadyExists() }
         // Verify if the address range is available for the new Node.
@@ -905,10 +930,7 @@ data class MeshNetwork internal constructor(
         require(_networkKeys.any { it.index == node.netKeys.first().index }) {
             throw DoesNotBelongToNetwork()
         }
-        // simdo-fork (2026-06-07, P6) — 구조적 변이를 nodesMonitor 로 직렬화([nodes] 스냅샷과 atomic).
-        synchronized(nodesMonitor) {
-            _nodes.add(node.also { it.network = this })
-        }
+        _nodes.add(node.also { it.network = this })
         updateTimestamp()
     }
 
@@ -927,11 +949,16 @@ data class MeshNetwork internal constructor(
      * @param uuid Uuid of the node to be removed.
      */
     fun remove(uuid: Uuid) {
-        _nodes
-            .find { it.uuid == uuid }
+        // simdo-fork (2026-06-08, P6) — find + remove 를 한 nodesMonitor 블록으로 원자화한다. 종전엔 find
+        // 가 lock 밖(raw _nodes 순회 → 동시 add/serialize 와 CME)이고 remove 만 lock 안이라 find-then-remove
+        // 가 비원자였다(같은 uuid 두 remove 가 같은 노드를 동시에 보고 둘 다 remove 시도 등). 이제 _nodes
+        // 컨테이너 무결성은 nodesMonitor 단일 guardian. 후속 cascade(_scenes/_networkExclusions/network=null)
+        // 는 _nodes 와 무관한 별 컬렉션이라 lock 밖에 둔다(_nodes 무결성에 영향 없음, lock 구간 최소화).
+        val node = synchronized(nodesMonitor) {
+            _nodes.find { it.uuid == uuid }?.also { _nodes.remove(it) }
+        }
+        node
             ?.let { node ->
-                // simdo-fork (2026-06-07, P6) — 구조적 변이를 nodesMonitor 로 직렬화.
-                synchronized(nodesMonitor) { _nodes.remove(node) }
                 // Remove unicast addresses of all node's elements from the scene
                 _scenes.forEach { it.remove(node.addresses) }
                 // When a Node is removed from the network, the unicast addresses that were used
@@ -1101,8 +1128,11 @@ data class MeshNetwork internal constructor(
      * @param range Unicast range to check.
      * @return true if the given address range is available for use or false otherwise.
      */
-    fun isAddressRangeAvailable(range: UnicastRange) = _nodes.none {
-        it.containsElementsWithAddress(range)
+    // simdo-fork (2026-06-08, P6) — _nodes raw 순회를 nodesMonitor 아래로. add() 가 이 함수를 호출할 때
+    // 이미 monitor 를 잡고 있어 재진입(JVM monitor reentrant)으로 안전. _networkExclusions 는 _nodes 와
+    // 무관한 별 컬렉션이라 monitor 밖 평가도 무방하나, 단일 식이라 한 블록에 둔다.
+    fun isAddressRangeAvailable(range: UnicastRange) = synchronized(nodesMonitor) {
+        _nodes.none { it.containsElementsWithAddress(range) }
     } && !_networkExclusions.contains(range, ivIndex)
 
     /**

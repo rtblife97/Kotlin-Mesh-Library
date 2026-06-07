@@ -52,6 +52,9 @@ class CdbMutationRaceTest {
         const val KEYS_PER_NODE = 32       // 노드당 동시 addNetKey/addAppKey 수
         const val SERIALIZE_ITERATIONS = 400
         const val PROVISION_NODES = 64     // P4: 동시 "provision add" 될 노드 수
+        // dual-lock 갭 (2026-06-08, B-F1/F2/F3/F5)
+        const val DUAL_WRITER_NODES = 64
+        const val DUAL_SERIALIZE_ITERATIONS = 600
     }
 
     /** handleResponses 와 동일한 internal mutator 로 노드에 키를 적재 (병렬). */
@@ -251,19 +254,35 @@ class CdbMutationRaceTest {
     }
 
     /**
-     * P4 재현(음성 대조군): 실제 cdbMutex 없이 N 노드 동시 provision-add + serialize → CME/lost-update.
-     * mutation-check 역할도 겸한다 — `withCdbLock` 을 무력화하면(=useRealCdbLock=false) 결함이 산다.
+     * dual-lock fix(2026-06-08, B-F1/F2/F3/F5) **이후** 갱신된 불변 — `_nodes` 만 다루는
+     * provision-add(remove+add)+serialize 는 **cdbMutex 없이도** CME/lost-update 0 이다.
+     *
+     * ## 왜 이 테스트가 "재현 음성 대조군"에서 "불변 가드"로 바뀌었나
+     *
+     * 종전(dual-lock fix 전)엔 [MeshNetwork.add]/[remove] 가 insert/remove 한 줄만 nodesMonitor 로
+     * 감쌌고 serialize 는 backing `_nodes` 를 raw 순회했다 → cdbMutex 가 없으면 `_nodes` 컨테이너에서
+     * CME/lost-update 가 났다(그래서 이 테스트가 `useRealCdbLock=false` 로 재현했다).
+     *
+     * dual-lock fix 가 `_nodes` 컨테이너 무결성의 **단일 guardian = nodesMonitor** 로 수렴시킨 뒤로는,
+     * add/remove(precheck 포함)·serialize 가 전부 nodesMonitor 아래라 **cdbMutex 유무와 무관하게**
+     * `_nodes` 레벨 결함이 0 이다. 즉 cdbMutex 는 더 이상 `_nodes` 컨테이너를 지키는 lock 이 아니라,
+     * 여러 CDB collection 에 걸친 **고수준 트랜잭션 ordering**(예 _appKeys/_subscribe 동시 mutation —
+     * `cdbMutex 없으면 ...` 테스트가 그쪽을 여전히 재현) 전용이다.
+     *
+     * mutation-check 는 dual-lock 섹션의 `withNodesLock 우회한 raw _nodes 순회는 CME` 가 담당한다
+     * (nodesMonitor 가드를 우회하면 backing list 가 여전히 CME-prone 임을 입증).
      */
     @Test
-    fun `P4 - cdbMutex 없이 동시 provisioning add 면 CME 또는 lost-update`() {
-        var observed: Throwable? = null
-        repeat(10) {
-            if (observed == null) observed = runProvisionRace(useRealCdbLock = false)
+    fun `dual-lock 이후 - _nodes-only provision race 는 cdbMutex 없이도 결함 0`() {
+        repeat(10) { round ->
+            val failure = runProvisionRace(useRealCdbLock = false)
+            assertEquals(
+                "round=$round — dual-lock fix 후 _nodes add/remove/serialize 는 nodesMonitor 단일 " +
+                    "guardian 으로 cdbMutex 없이도 CME/lost-update 0 이어야 한다. 실제: $failure",
+                null,
+                failure,
+            )
         }
-        assertTrue(
-            "lock 없는 동시 provisioning add+serialize 는 CME/lost-update 를 일으켜야 한다. 실제: $observed",
-            observed != null,
-        )
     }
 
     /**
@@ -318,5 +337,176 @@ class CdbMutationRaceTest {
             assertEquals(KEYS_PER_NODE, it.netKeys.size)
             assertEquals(KEYS_PER_NODE, it.appKeys.size)
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // dual-lock 갭 (simdo-fork, 2026-06-08 — B-F1/F2/F3/F5). 코드리뷰 R1.
+    //
+    // `_nodes` 는 nodesMonitor(synchronized) + cdbMutex(suspend) 두 disjoint lock 으로 보호됐으나
+    // 상호배제하지 못했다. 위 Fork-3/P4 테스트는 **writer 와 serialize reader 둘 다 같은 cdbMutex 를
+    // 잡아** de-facto 직렬화돼 갭을 마스킹했다. 실제 노출 경로(node-delete UX / force-remove / 직접
+    // export)는 cdbMutex 를 잡지 않은 채 nodesMonitor-only [add]/[remove] 가 cdbMutex-없는 serialize
+    // 트래버설과 동시에 도는데, 이 둘이 서로 block 안 해 CME 가 재발한다.
+    //
+    // fix: `_nodes` 컨테이너 무결성의 단일 guardian = nodesMonitor 로 수렴. [add]/[remove]/node lookup/
+    // isAddress*/serialize 전부 nodesMonitor 아래. 본 테스트는 **어느 쪽도 cdbMutex 를 잡지 않은 채**
+    // 동시 mutation + serialize 를 돌려 그 수렴을 가드한다(위 테스트가 못 덮는 cross-lock 경로).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * dual-lock 갭 positive 가드 — **cdbMutex 없이** nodesMonitor-only [add]/[remove] 가
+     * cdbMutex-없는 [MeshNetworkSerializer.serialize] 트래버설과 동시에 돌아도 CME 0.
+     *
+     * (production 노출 경로 모사: node-delete UX/force-remove 는 cdbMutex 를 안 잡고 [remove] 만 호출,
+     * autosave/export serialize 도 동시 진행. fix 전이면 serialize 가 backing `_nodes` 를 raw 순회하다
+     * 동시 구조 변이와 CME → fix 후 serialize 가 withNodesLock 으로 감싸 0.)
+     */
+    @Test
+    fun `dual-lock - cdbMutex 없는 add_remove 와 cdbMutex 없는 serialize 동시도 CME 0`() {
+        val failure = AtomicReference<Throwable?>(null)
+
+        repeat(5) { round ->
+            if (failure.get() != null) return@repeat
+            val network = MeshNetwork(name = "Dual Lock Race $round").apply {
+                add(name = "Primary Network Key", index = 0u)
+            }
+            runBlocking {
+                try {
+                    coroutineScope {
+                        // writer: cdbMutex 미보유 — nodesMonitor-only add/remove (force-delete 동형).
+                        val writers = (0 until DUAL_WRITER_NODES).map { n ->
+                            async(Dispatchers.Default) {
+                                val node = Node(name = "Node $n", address = 1 + n, elements = 1)
+                                network.add(node = node)
+                                if (n % 2 == 0) network.remove(uuid = node.uuid)
+                            }
+                        }
+                        // reader: cdbMutex 미보유 — serialize 트래버설(autosave/export 동형).
+                        val readers = (0 until 4).map {
+                            async(Dispatchers.Default) {
+                                repeat(DUAL_SERIALIZE_ITERATIONS) {
+                                    runCatching {
+                                        MeshNetworkSerializer.serialize(
+                                            network = network,
+                                            configuration = NetworkConfiguration.Full,
+                                        )
+                                    }.onFailure { failure.compareAndSet(null, it) }
+                                }
+                            }
+                        }
+                        (writers + readers).awaitAll()
+                    }
+                } catch (t: Throwable) {
+                    failure.compareAndSet(null, t)
+                }
+            }
+        }
+
+        assertEquals(
+            "nodesMonitor 단일 guardian — cdbMutex 없는 add/remove + cdbMutex 없는 serialize 는 CME 0 " +
+                "이어야 한다(serialize 가 withNodesLock 으로 감싸짐). 실제: ${failure.get()}",
+            null,
+            failure.get(),
+        )
+    }
+
+    /**
+     * 음성 대조군(mutation-check) — withNodesLock 를 우회해 backing `_nodes` 를 **직접** raw 순회하면
+     * (= fix 전 serialize 가 backing list 를 raw iterate 하던 동작), 동시 구조 변이와 CME 가 난다.
+     * 이로써 serialize 의 withNodesLock 감싸기가 load-bearing 임을 입증한다(타이밍 의존 → 반복 관측).
+     */
+    @Test
+    fun `dual-lock - withNodesLock 우회한 raw _nodes 순회는 CME 를 일으킨다(필요성 입증)`() {
+        var observed: Throwable? = null
+        repeat(10) {
+            if (observed != null) return@repeat
+            val network = MeshNetwork(name = "Dual Lock Negative").apply {
+                add(name = "Primary Network Key", index = 0u)
+            }
+            runBlocking {
+                runCatching {
+                    coroutineScope {
+                        val writers = (0 until DUAL_WRITER_NODES).map { n ->
+                            async(Dispatchers.Default) {
+                                network.add(node = Node(name = "Node $n", address = 1 + n, elements = 1))
+                            }
+                        }
+                        val readers = (0 until 4).map {
+                            async(Dispatchers.Default) {
+                                repeat(DUAL_SERIALIZE_ITERATIONS) {
+                                    runCatching {
+                                        // backing list 직접 raw 순회 = fix 전 serialize 의 _nodes 트래버설.
+                                        network._nodes.forEach { node -> node.uuid.hashCode() }
+                                    }.onFailure { if (observed == null) observed = it }
+                                }
+                            }
+                        }
+                        (writers + readers).awaitAll()
+                    }
+                }.onFailure { if (observed == null) observed = it }
+            }
+        }
+        assertTrue(
+            "withNodesLock 우회 raw _nodes 순회는 동시 구조 변이와 CME 를 일으켜야 한다(가드 필요성 입증). " +
+                "실제: $observed",
+            observed is java.util.ConcurrentModificationException,
+        )
+    }
+
+    /**
+     * find-then-remove 원자성 가드 — 같은 uuid 의 [remove] 를 다중 스레드가 동시에 호출해도 결함 0이고,
+     * node lookup([MeshNetwork.node])도 동시에 안전하다(전부 nodesMonitor 아래 _nodes 직접 접근).
+     */
+    @Test
+    fun `dual-lock - 동시 remove(uuid)+node lookup 이 원자적이고 CME 0`() {
+        val failure = AtomicReference<Throwable?>(null)
+        repeat(5) { round ->
+            if (failure.get() != null) return@repeat
+            val network = MeshNetwork(name = "Atomic Remove $round").apply {
+                add(name = "Primary Network Key", index = 0u)
+            }
+            val nodes = (0 until DUAL_WRITER_NODES).map { n ->
+                Node(name = "Node $n", address = 1 + n, elements = 1).also { network.add(node = it) }
+            }
+            runBlocking {
+                try {
+                    coroutineScope {
+                        // 각 노드마다 2 스레드가 같은 uuid 로 동시 remove → find-then-remove 비원자면 race.
+                        val removers = nodes.flatMap { node ->
+                            (0 until 2).map {
+                                async(Dispatchers.Default) {
+                                    runCatching { network.remove(uuid = node.uuid) }
+                                        .onFailure { failure.compareAndSet(null, it) }
+                                }
+                            }
+                        }
+                        // 동시 lookup — nodesMonitor 아래 _nodes 직접 find.
+                        val lookups = (0 until 4).map {
+                            async(Dispatchers.Default) {
+                                repeat(2000) {
+                                    runCatching { nodes.forEach { network.node(uuid = it.uuid) } }
+                                        .onFailure { failure.compareAndSet(null, it) }
+                                }
+                            }
+                        }
+                        (removers + lookups).awaitAll()
+                    }
+                } catch (t: Throwable) {
+                    failure.compareAndSet(null, t)
+                }
+            }
+            // 모든 노드가 정확히 제거됐는지(local provisioner 제외, 또는 본 테스트는 provisioner 없음 → 0).
+            if (failure.get() == null && network.nodes.isNotEmpty()) {
+                failure.compareAndSet(
+                    null,
+                    AssertionError("동시 중복 remove 후 잔존 노드: ${network.nodes.size} (기대 0)"),
+                )
+            }
+        }
+        assertEquals(
+            "동시 remove(uuid)+lookup 은 원자적·CME 0 이어야 한다. 실제: ${failure.get()}",
+            null,
+            failure.get(),
+        )
     }
 }

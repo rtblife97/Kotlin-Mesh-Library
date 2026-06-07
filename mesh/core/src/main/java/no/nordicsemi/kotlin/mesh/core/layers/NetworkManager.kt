@@ -4,8 +4,10 @@ package no.nordicsemi.kotlin.mesh.core.layers
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.catch
@@ -145,9 +147,14 @@ internal class NetworkManager internal constructor(
         if (_bearers[destination] === meshBearer) return@synchronized
         // 같은 dst 에 이전 bearer 가 있었다면 그 collector 를 먼저 정리(누수 방지).
         bearerCollectorJobs.remove(destination)?.cancel()
+        // simdo-fork (2026-06-08, A-H1) — RX collector 를 **먼저** 띄우고 그게 살아 있을 때만 _bearers 에
+        // 커밋한다. 종전엔 _bearers 커밋(TX 라우팅 활성)이 collector 생성 앞이라, awaitBearerPdus 가 null
+        // (bearer.pdus 미가용)이면 반쪽 등록(TX 는 이 bearer 로 가나 RX 없음)이 됐다. 둘 다 bearersLock
+        // 안이라 어차피 원자지만, 순서를 RX-then-TX 로 바로잡아 반쪽 등록 가능성을 구조적으로 제거한다.
+        // (현 구현 awaitBearerPdus 는 bearer 가 non-null 이고 pdus 가 항상 있으면 non-null Job 반환.)
+        val job = awaitBearerPdus(bearer = meshBearer) ?: return@synchronized
+        bearerCollectorJobs[destination] = job
         _bearers = _bearers + (destination to meshBearer)
-        bearerCollectorJobs[destination] = awaitBearerPdus(bearer = meshBearer)
-            ?: return@synchronized
         logger?.i(LogCategory.BEARER) {
             "Registered per-dest bearer for 0x${destination.toHexString()}"
         }
@@ -414,15 +421,27 @@ internal class NetworkManager internal constructor(
         destination: MeshAddress,
         initialTtl: UByte?,
         applicationKey: ApplicationKey,
-    ): MeshMessage? = if (!ensureNotBusy(destination = destination)) accessLayer.send(
-        message = message,
-        element = element,
-        destination = destination,
-        ttl = initialTtl,
-        applicationKey = applicationKey,
-        retransmit = false
-    ).also {
-        mutex.withLock { outgoingMessages.remove(destination) }
+    ): MeshMessage? = if (!ensureNotBusy(destination = destination)) {
+        // simdo-fork (2026-06-08, C-F2) — busy-set 누수 봉인. 종전 `.also{}` 는 정상 return 시만 remove 라
+        // accessLayer.send 가 timeout(awaitMeshMessageResponse re-throw)/cancel 로 throw 하면 dst 가
+        // outgoingMessages 에 영구 잔류 → 같은 dst 재시도가 Busy. try/finally 로 throw/cancel/정상 모두 remove.
+        // ensureNotBusy 가 add 성공(=false 반환) 한 뒤에만 이 블록에 진입하므로 finally remove 가 항상 짝맞음
+        // (ensureNotBusy 가 Busy throw 하면 add 안 했고 이 블록 미진입 → 남의 엔트리 오삭제 없음).
+        try {
+            accessLayer.send(
+                message = message,
+                element = element,
+                destination = destination,
+                ttl = initialTtl,
+                applicationKey = applicationKey,
+                retransmit = false
+            )
+        } finally {
+            // NonCancellable — outer cancel(예: caller withTimeout) 로 코루틴이 cancel 된 상태에선
+            // finally 내 suspend(mutex.withLock)도 즉시 CancellationException 을 던져 remove 가 건너뛰어진다.
+            // busy-set 정리는 cancel 경로에서도 반드시 일어나야 하므로 NonCancellable 로 보장한다.
+            withContext(NonCancellable) { mutex.withLock { outgoingMessages.remove(destination) } }
+        }
     } else null
 
     /**
@@ -453,15 +472,20 @@ internal class NetworkManager internal constructor(
         //val meshAddress = MeshAddress.create(address = destination)
         require(!ensureNotBusy(destination = destination)) { return null }
 
-        return accessLayer.send(
-            message = message,
-            element = element,
-            destination = destination,
-            ttl = initialTtl,
-            applicationKey = applicationKey,
-            retransmit = false
-        ).also {
-            mutex.withLock { outgoingMessages.remove(destination) }
+        // simdo-fork (2026-06-08, C-F2) — busy-set 누수 봉인. ensureNotBusy add 성공 후에만 try 진입 →
+        // accessLayer.send 가 ack timeout 으로 throw 해도 finally 가 outgoingMessages 에서 dst 제거.
+        return try {
+            accessLayer.send(
+                message = message,
+                element = element,
+                destination = destination,
+                ttl = initialTtl,
+                applicationKey = applicationKey,
+                retransmit = false
+            )
+        } finally {
+            // NonCancellable — cancel 경로에서도 busy-set 정리 보장(위 send 참조).
+            withContext(NonCancellable) { mutex.withLock { outgoingMessages.remove(destination) } }
         }
     }
 
@@ -491,15 +515,20 @@ internal class NetworkManager internal constructor(
     ) {
         val meshAddress = MeshAddress.create(address = destination)
         require(!ensureNotBusy(destination = meshAddress)) { throw Busy() }
-        accessLayer.send(
-            message = configMessage,
-            localElement = element,
-            destination = destination,
-            initialTtl = initialTtl,
-            networkKey = networkKey
-        ).also {
+        // simdo-fork (2026-06-08, C-F2) — busy-set 누수 봉인. ensureNotBusy add 성공 후에만 try 진입 →
+        // accessLayer.send throw/cancel 시에도 finally 가 outgoingMessages 에서 meshAddress 제거.
+        try {
+            accessLayer.send(
+                message = configMessage,
+                localElement = element,
+                destination = destination,
+                initialTtl = initialTtl,
+                networkKey = networkKey
+            )
+        } finally {
             // Added to clear the outgoing message list
-            mutex.withLock { outgoingMessages.remove(meshAddress) }
+            // NonCancellable — cancel 경로에서도 busy-set 정리 보장(위 send 참조).
+            withContext(NonCancellable) { mutex.withLock { outgoingMessages.remove(meshAddress) } }
         }
     }
 
@@ -531,15 +560,22 @@ internal class NetworkManager internal constructor(
     ): MeshMessage? {
         val meshAddress = MeshAddress.create(address = destination)
         require(!ensureNotBusy(destination = meshAddress)) { return null }
-        return accessLayer.send(
-            message = configMessage,
-            localElement = element,
-            destination = destination,
-            initialTtl = initialTtl,
-            networkKey = networkKey
-        ).also {
+        // simdo-fork (2026-06-08, C-F2) — busy-set 누수 봉인. ensureNotBusy add 성공 후에만 try 진입 →
+        // config ack timeout(awaitMeshMessageResponse re-throw)/cancel 에도 finally 가 meshAddress 제거.
+        // P6: outgoingMessages 는 dst-keyed(registry/default 무관) — config 실패가 같은 dst 의 측위/group
+        // 제어 채널까지 Busy 오염시키던 누수를 봉인한다.
+        return try {
+            accessLayer.send(
+                message = configMessage,
+                localElement = element,
+                destination = destination,
+                initialTtl = initialTtl,
+                networkKey = networkKey
+            )
+        } finally {
             // Added to clear the outgoing message list
-            mutex.withLock { outgoingMessages.remove(meshAddress) }
+            // NonCancellable — cancel 경로에서도 busy-set 정리 보장(위 send 참조).
+            withContext(NonCancellable) { mutex.withLock { outgoingMessages.remove(meshAddress) } }
         }
     }
 

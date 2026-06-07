@@ -299,4 +299,57 @@ class PerDestBearerRegistryTest {
             }
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // busy-set 누수 봉인 회귀 가드 (simdo-fork, 2026-06-08 — C-F2). 코드리뷰 R1.
+    //
+    // 종전 NetworkManager.send 5변형은 `accessLayer.send(...).also { outgoingMessages.remove(dst) }`
+    // 였다. `.also` 는 **정상 return 시만** 실행되므로, accessLayer.send 가 ack timeout(또는 outer
+    // cancel)으로 throw 하면 dst 가 outgoingMessages 에 영구 잔류 → 같은 dst 재시도 send 가 Busy 로
+    // 거부된다(M=7 에서 timeout 빈도↑로 누수 누적). fix: `.also` → try/finally 로 throw/cancel/정상
+    // 모두 remove 보장.
+    //
+    // 본 테스트는 StubBearer(send=no-op) 로 ack 가 절대 오지 않게 해 send 를 timeout/cancel 시킨 뒤,
+    // **같은 dst 재시도가 Busy 를 던지지 않는지**(=busy-set 이 비워졌는지) 검증한다.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * timeout/cancel 로 throw 된 첫 send 가 busy-set 을 비우는지 — 같은 dst 두 번째 send 가 Busy 안 난다.
+     * (fix 전: 첫 send 가 throw 하면 `.also` 미실행 → dst 잔류 → 두 번째가 Busy. fix 후: finally 가 제거.)
+     */
+    @Test
+    fun `timeout 으로 throw 된 send 후 같은 dst 재시도가 Busy 안 난다(누수 봉인)`() {
+        val mgr = freshNetworkManager()
+        // per-dest bearer(send=no-op) 등록 → 가드 통과하되 ack 는 영원히 안 옴 → 응답 대기 throw.
+        mgr.registerBearer(remoteNode, StubBearer("noop-0x0002"))
+
+        fun sendOnce(): Throwable? = runBlocking {
+            runCatching {
+                withTimeout(200.milliseconds) {
+                    mgr.send(
+                        message = ConfigCompositionDataGet(page = 0xFFu),
+                        destination = remoteNode,
+                    )
+                }
+            }.exceptionOrNull()
+        }
+
+        // 1차: ack 없이 timeout/cancel 로 throw — finally 가 busy-set 에서 dst 제거해야 한다.
+        val first = sendOnce()
+        assertTrue(
+            "1차 send 는 ack 부재로 throw 돼야 한다(timeout/cancel). 실제: $first",
+            first is TimeoutCancellationException || first is kotlinx.coroutines.CancellationException,
+        )
+
+        // 2차: 같은 dst 재시도 — busy-set 이 비었으면 Busy 가 아니라 다시 timeout 으로 빠진다.
+        val second = sendOnce()
+        assertFalse(
+            "2차 send 가 Busy 면 busy-set 누수다(finally 미적용). 실제: $second",
+            second is no.nordicsemi.kotlin.mesh.core.layers.access.Busy,
+        )
+        assertTrue(
+            "2차 send 도 ack 부재로 timeout/cancel 이어야 한다(누수 0 → 정상 재진입). 실제: $second",
+            second is TimeoutCancellationException || second is kotlinx.coroutines.CancellationException,
+        )
+    }
 }
