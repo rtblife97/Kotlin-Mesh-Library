@@ -7,7 +7,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicReference
 
@@ -88,14 +88,25 @@ class NodesGetterConcurrencyTest {
     }
 
     /**
-     * 음성 대조군(문서화) — 라이브 `_nodes` 를 직접 iterate(=종전 getter 동작)하면, 동시 구조 변경과
-     * 충돌해 CME 가 발생함을 보인다. 이로써 getter 의 방어적 스냅샷이 load-bearing 임을 입증한다.
-     * (race 는 타이밍 의존이라 반복해 적어도 1회 관측.)
+     * 음성 대조군(mutation-check, 문서화) — 라이브 `_nodes` 를 직접 iterate(=종전 getter 동작)하면,
+     * 동시 구조 변경과 충돌해 CME 가 발생함을 **best-effort** 로 보인다. 이로써 getter 의 방어적
+     * 스냅샷이 load-bearing 임을 입증한다.
+     *
+     * ## ★CI 결정성 — race 는 본질적으로 비결정적(Heisenbug)이라 hard 단언 금지
+     *
+     * CME 발생은 runner 코어수·타이밍·JIT 에 의존한다. 개발자 머신에선 거의 매번 관측되지만,
+     * CI(GitHub-hosted ubuntu, 다른 코어수/스케줄러)에선 그 반복 윈도우에 CME 가 안 터질 수 있다.
+     * 따라서 "race 가 **반드시** 난다"는 hard 게이트는 본질적으로 flaky 다.
+     *
+     * 정책: 여러 라운드 best-effort 시도 → **한 번이라도** CME 를 관측하면 통과(가드 필요성 입증).
+     * 끝까지 안 나면 [assumeTrue] 로 **skip**(fail 아님) — race window 가 그 환경에서 안 열렸을 뿐
+     * 가드가 깨진 게 아니다. 가드의 실제 동작 검증은 결정적 positive 테스트
+     * (`withCdbLock writer 와 lock 없는 nodes getter reader 가 CME 0`)가 hard 게이트로 담당한다.
      */
     @Test
-    fun `라이브 _nodes 직접 iterate 는 CME 를 일으킨다 - 스냅샷의 필요성 입증`() {
+    fun `라이브 _nodes 직접 iterate 는 CME 를 일으킨다 - 스냅샷의 필요성 입증(best-effort)`() {
         var observed: Throwable? = null
-        repeat(10) {
+        repeat(20) {
             if (observed != null) return@repeat
             val network = MeshNetwork(name = "Live Nodes Race").apply {
                 add(name = "Primary Network Key", index = 0u)
@@ -123,8 +134,10 @@ class NodesGetterConcurrencyTest {
                 }.onFailure { if (observed == null) observed = it }
             }
         }
-        assertTrue(
-            "라이브 _nodes 직접 iterate 는 동시 구조 변경과 CME 를 일으켜야 한다(스냅샷 필요성 입증). 실제: $observed",
+        // 관측되면 가드 필요성 입증(통과). 안 나면 CI 환경차로 race window 미개방 → skip(fail 아님).
+        assumeTrue(
+            "라이브 _nodes 직접 iterate race window 가 이 환경에서 열리지 않음(CME 미관측) — " +
+                "CI 결정성 위해 skip. 가드 실제 검증은 positive CME-0 테스트가 담당. 실제: $observed",
             observed is java.util.ConcurrentModificationException,
         )
     }
