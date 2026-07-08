@@ -148,16 +148,15 @@ class VendorModelId(
                 })"
     }
 
+    // simdo-fork (2026-07-08) — copy-paste 버그 fix: 종전 `if (other !is SigModelId) return false`
+    // 였다 → 동일 VendorModelId 두 개가 절대 equal 이 아니었고(vendor-vs-vendor 는 항상 false),
+    // hashCode 와도 불일치(HashSet/HashMap/distinctBy/== 전부 vendor 에서 오작동). 실기기(Silvair
+    // Cylinder Sensor cid 0x0136, vendor model 14개) identity 실패의 근원. id(32-bit) 단일 비교로 교정.
     override fun equals(other: Any?): Boolean {
-        if (other !is SigModelId)
+        if (other !is VendorModelId)
             return false
-        return modelIdentifier == other.modelIdentifier
+        return id == other.id
     }
 
-    override fun hashCode(): Int {
-        var result = id.hashCode()
-        result = 31 * result + companyIdentifier.hashCode()
-        result = 31 * result + modelIdentifier.hashCode()
-        return result
-    }
+    override fun hashCode(): Int = id.hashCode()
 }
