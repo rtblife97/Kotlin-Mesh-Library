@@ -448,9 +448,24 @@ class MeshNetworkManager(
      * @return a mesh network configuration decoded from the given byte array.
      * @throws ImportError if deserializing fails.
      */
+    @OptIn(ExperimentalUuidApi::class)
     @Throws(ImportError::class)
     suspend fun import(array: ByteArray) = runCatching {
         deserialize(array)
+            // simdo-fork (2026-08-11) — IV Index 복원. `MeshNetwork.ivIndex` 는 @Transient 이고
+            // CDB Profile 스키마에도 최상위 ivIndex 가 없으므로 deserialize 결과는 항상 IvIndex(0).
+            // `load()` 는 :320 에서 secure properties 로 복원하는데 `import()` 는 누락되어 있었다.
+            // 그 상태로 송신하면 NetworkPdu 가 IV 0 으로 암호화되고, 망 IV Index 가 2 이상이면
+            // 수신 노드가 iv_index / iv_index-1 로만 복호를 시도하므로 전량 무음 폐기된다
+            // (obfuscation/MIC 실패). 첫 Secure Network Beacon 수신 시 NetworkLayer 가 교정하지만
+            // 그 전까지 창이 열리고, 세션 중 import(서버 CDB 변경 수신 등)에서는 이미 SNB 를 받은
+            // 뒤라 다음 SNB 까지 창이 유지된다.
+            //
+            // 조회 키는 **import 되는 CDB 자신의 uuid** — venue/프로젝트 전환 시 이전 망과 다른
+            // uuid 일 수 있으므로 반드시 수신 객체 기준으로 조회해야 한다.
+            // 사이드카에 row 가 없으면(SNB 를 한 번도 못 받은 신규 망) IvIndex(0) 이 반환되며,
+            // 이는 기존 동작과 동일하고 첫 SNB 로 정렬되므로 무해하다.
+            .apply { ivIndex = secureProperties.ivIndex(uuid = uuid) }
             .also { network ->
                 this.network = network
                 networkManager = NetworkManager(this)
