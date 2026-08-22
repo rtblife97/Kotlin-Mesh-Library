@@ -29,6 +29,16 @@ dependencyResolutionManagement {
         }
         create("nordic") {
             from("no.nordicsemi.android:version-catalog:2025.12.01")
+            // simdo-patch(mesh-dfu backport): Mesh DFU 메시지는 BLOB ID 를 ULong(8바이트)
+            //   으로 다루므로 `ByteArray.getULong()` / `ULong.toByteArray()` /
+            //   `Long.toByteArray()` 가 필요하다. nordic 카탈로그 2025.12.01 이 지정한
+            //   no.nordicsemi.kotlin:data 0.5.0 에는 이 3개가 없고 0.6.0 에서 추가됐다.
+            //   (upstream feature/mesh-dfu 는 `includeBuild("../Kotlin-Util-Library")` 로
+            //    미배포 로컬 소스를 썼기 때문에 자기 CI 에서는 드러나지 않은 의존성이다.)
+            //   0.5.0 → 0.6.0 은 순수 추가 릴리스이며 data 는 전 모듈에서
+            //   `implementation` 스코프라 android/ 로 새지 않는다.
+            //   ⚠️ 1.x 로는 올리지 말 것 — KMP 로 재구조화되어 JVM artifact 좌표가 바뀐다.
+            version("data", "0.6.0")
         }
     }
 }

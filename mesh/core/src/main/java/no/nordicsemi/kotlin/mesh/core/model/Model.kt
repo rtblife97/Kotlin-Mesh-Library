@@ -167,9 +167,6 @@ class Model internal constructor(
             ?.filter { it.isBoundTo(this) }
             ?: emptyList()
 
-    val supportsApplicationKeyBinding: Boolean
-        get() = !requiresDeviceKey
-
     val supportsDeviceKey: Boolean
         get() = requiresDeviceKey || isOpcodesAggregatorServer || isOpcodesAggregatorClient
 
@@ -228,6 +225,9 @@ class Model internal constructor(
 
     @Transient
     var eventHandler: ModelEventHandler? = null
+
+    val supportsApplicationKeyBinding: Boolean
+        get() = !requiresDeviceKey
 
     val supportsModelPublication: Boolean?
         get() = when ((modelId as? SigModelId)?.modelIdentifier) {
@@ -334,7 +334,23 @@ class Model internal constructor(
             LIGHT_LC_SETUP_SERVER_MODEL_ID,
             LIGHT_LC_CLIENT_MODEL_ID,
                 -> true
+            // BLOB Transfer
+            BLOB_TRANSFER_SERVER_MODEL_ID,
+            BLOB_TRANSFER_CLIENT_MODEL_ID,
+                -> false
+            // Device Firmware Update
+            FIRMWARE_UPDATE_SERVER_MODEL_ID,
+            FIRMWARE_UPDATE_CLIENT_MODEL_ID,
+            FIRMWARE_DISTRIBUTION_SERVER_MODEL_ID,
+            FIRMWARE_DISTRIBUTION_CLIENT_MODEL_ID,
+                -> false
 
+            // simdo-patch (2026-08-12, 감사 P2-c): 백포트가 `null` -> `false` 로 바꾼 것을
+            // upstream/main 정합으로 되돌린다. `null` = "라이브러리가 알 수 없음"이고
+            // `false` = "지원하지 않음"이다. else 분기에 떨어지는 것은 **벤더 모델 전부**인데
+            // (우리 프로젝트는 0x0059Exxx 벤더 모델의 pub/sub 가 핵심), 라이브러리가 벤더
+            // 모델의 pub/sub 지원 여부를 알 방법이 없으므로 `false` 는 false negative 다.
+            // 소비처는 전부 `== true` / `!= false` 형태라 되돌려도 컴파일·동작 영향 0.
             else -> null
         }
 
@@ -427,8 +443,14 @@ class Model internal constructor(
             LIGHT_LC_SERVER_MODEL_ID,
             LIGHT_LC_SETUP_SERVER_MODEL_ID,
             LIGHT_LC_CLIENT_MODEL_ID,
+                // Device Firmware Update
+            FIRMWARE_UPDATE_SERVER_MODEL_ID,
+            FIRMWARE_UPDATE_CLIENT_MODEL_ID,
+            FIRMWARE_DISTRIBUTION_SERVER_MODEL_ID,
+            FIRMWARE_DISTRIBUTION_CLIENT_MODEL_ID,
                 -> true
 
+            // simdo-patch (2026-08-12, 감사 P2-c): 위 supportsModelPublication 과 같은 이유.
             else -> null
         }
 
@@ -573,6 +595,14 @@ class Model internal constructor(
 
         else -> false
     }
+
+    /**
+     * Returns the bound application key for a given key index
+     *
+     * @param index Application key index.
+     * @return Bound application key or null if the key index is not bound to the model
+     */
+    fun boundApplicationKey(index: KeyIndex) = boundApplicationKeys.find { it.index == index }
 
     /**
      * Sets the [Publish] settings for this model.
