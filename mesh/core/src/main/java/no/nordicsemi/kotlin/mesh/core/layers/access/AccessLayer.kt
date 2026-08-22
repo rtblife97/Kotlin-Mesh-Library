@@ -21,6 +21,7 @@ import no.nordicsemi.kotlin.mesh.core.messages.AcknowledgedMeshMessage
 import no.nordicsemi.kotlin.mesh.core.messages.ConfigAnyModelMessage
 import no.nordicsemi.kotlin.mesh.core.messages.ConfigMessage
 import no.nordicsemi.kotlin.mesh.core.messages.MeshMessage
+import no.nordicsemi.kotlin.mesh.core.messages.RemoteProvisioningMessage
 import no.nordicsemi.kotlin.mesh.core.messages.MeshResponse
 import no.nordicsemi.kotlin.mesh.core.messages.TransactionMessage
 import no.nordicsemi.kotlin.mesh.core.messages.UnacknowledgedMeshMessage
@@ -594,7 +595,19 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                             handle(message = message)
                         }
                     }
-                    networkManager.emitNetworkManagerEvent(event = NetworkManagerEvent.OnNetworkChanged)
+                    // simdo-fork (2026-08-12, 감사 P1-4) — RPR RX 의 save 증폭 차단.
+                    // 이 emit 은 MeshNetworkManager 에서 곧바로 save() 로 이어진다
+                    // (MeshNetworkManager.observeNetworkManagerEvents: OnNetworkChanged -> save()).
+                    // Device Key 경로가 원래 Config* 응답 전용이었을 때는 "상태가 바뀌었으니 저장"이
+                    // 참이었지만, RPR Client 모델이 requiresDeviceKey 에 포함되어 있어
+                    // Scan Report / PDU Report / Link Report 도 이 분기에 들어온다.
+                    // 그것들은 CDB 를 한 글자도 바꾸지 않으므로(RemoteProvisioningClientHandler
+                    // 는 순수 pass-through) 저장은 의미상으로도 틀렸고, 10초 스캔 세션 30기기 =
+                    // 네트워크 전체 직렬화 30회, 기기 1대 PB-Remote 프로비저닝 ≈ 10회가 된다.
+                    // 판정은 mutatesNetworkState() 한 곳에 모아 테스트로 봉인한다.
+                    if (message.mutatesNetworkState()) {
+                        networkManager.emitNetworkManagerEvent(event = NetworkManagerEvent.OnNetworkChanged)
+                    }
                 } else {
                     logger?.i(LogCategory.FOUNDATION_MODEL) {
                         "$message received from: ${
@@ -780,6 +793,27 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
         }
     }
 }
+
+/**
+ * Whether receiving this message on the Device Key path can have changed persisted network state.
+ *
+ * simdo-fork (2026-08-12, 감사 P1-4). `AccessLayer.handle()` 의 Device Key 분기는 수신 메시지마다
+ * `NetworkManagerEvent.OnNetworkChanged` 를 emit 하고 `MeshNetworkManager` 가 그것을 `save()`
+ * (= 네트워크 전체 직렬화 + `Storage.save`) 로 받는다.
+ *
+ * Device Key 로 보호되는 모델 중 **Remote Provisioning Client 만** 상태를 바꾸지 않는 순수
+ * 리포트 스트림(Scan Report / Extended Scan Report / Link Status / Link Report /
+ * PDU Outbound Report / PDU Report)을 만든다. 나머지(Configuration / Private Beacon /
+ * SAR Configuration / Large Composition Data / Opcodes Aggregator …)는 전부 CDB 를 갱신하므로
+ * **기존 동작을 그대로 유지한다.**
+ *
+ * 화이트리스트가 아니라 블랙리스트(RPR 만 제외)로 쓴 이유: 새 Config 계열 메시지가 추가될 때
+ * 기본값이 "저장한다"여야 안전하기 때문이다. 이 함수는
+ * `AccessLayerNetworkStateEmitTest` 로 봉인돼 있다.
+ *
+ * @return true if the emit (and therefore the save) must happen.
+ */
+internal fun MeshMessage.mutatesNetworkState(): Boolean = this !is RemoteProvisioningMessage
 
 /**
  * Attempts to decode the given AccessPdu. The Model Handler must support the opcode to specify to
