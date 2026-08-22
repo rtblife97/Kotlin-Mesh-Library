@@ -1,3 +1,8 @@
+// simdo-patch (2026-08-12): upstream 이 이 파일에 `ExperimentalUuidApi` opt-in 을 빠뜨려
+// `:mesh:provisioning:compileTestKotlin` 이 통째로 깨져 있었다(테스트 0개 실행).
+// 한 줄 opt-in 으로 provisioning 테스트 소스셋 전체를 복구한다.
+@file:OptIn(kotlin.uuid.ExperimentalUuidApi::class)
+
 package no.nordicsemi.kotlin.mesh.provisioning
 
 import no.nordicsemi.kotlin.data.toHexString

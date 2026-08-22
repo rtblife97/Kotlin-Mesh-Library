@@ -9,3 +9,8 @@ release/
 .externalNativeBuild
 /.kotlin
 *.gpg
+
+# simdo-patch (2026-08-12, 감사 P2-h): Eclipse/IDE 가 만드는 `bin/` 은 **낡은 소스 사본**이라
+# grep 을 오염시키고 `git add -A` 사고를 만든다 (8개 모듈 2.3 MB 가 untracked 로 방치돼 있었다).
+# `build/` 와 달리 기본 .gitignore 에 없어 명시가 필요하다.
+bin/
