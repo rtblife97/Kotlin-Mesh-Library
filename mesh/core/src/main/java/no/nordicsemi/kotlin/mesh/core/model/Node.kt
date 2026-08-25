@@ -209,6 +209,35 @@ data class Node internal constructor(
             network?.updateTimestamp()
         }
 
+    /**
+     * simdo-patch (2026-08-25) — [defaultTTL] 의 public mutator.
+     *
+     * [defaultTTL] 의 setter 는 `internal` 이라 라이브러리 내부(원격 노드의
+     * `ConfigDefaultTtlStatus` 수신 / 로컬 노드에 도착한 `ConfigDefaultTtlSet` 처리)에서만
+     * 쓰인다. 그런데 **local Provisioner 자신의 노드**는 그 두 경로 어디에도 해당하지 않는다
+     * — 자기 자신에게 Config 메시지를 보내지 않기 때문이다. 결과적으로 상위 stack(앱) 이
+     * "이 망은 홉이 깊으니 내 송신 TTL 은 40" 이라는 운영 정책을 CDB 에 기록할 방법이 없었다.
+     *
+     * 송신 TTL 우선순위가
+     * `initialTtl ?: localProvisioner.node.defaultTTL ?: networkParameters.defaultTtl`
+     * 이므로, CDB 에 남아 있는 낮은 값(예: 과거 export 의 5)은 앱이 설정한
+     * `networkParameters.defaultTtl` 을 **덮어쓴다**. 즉 CDB 를 고칠 수단이 없으면
+     * NetworkParameters 만으로는 정책을 관철할 수 없다.
+     *
+     * [markConfigComplete] 와 동일한 패턴(명시 mutator, setter 는 internal 유지). 호출 후
+     * `MeshNetworkManager.save()` 로 persist 권장.
+     *
+     * @param ttl 새 Default TTL. `null` = 미설정(폴백 사용). SIG Mesh Profile 1.0.1 §4.3.2.25
+     *   (Config Default TTL Set) 기준 유효값은 0 또는 2..127 (1 은 prohibited).
+     * @throws IllegalArgumentException 유효 범위 밖일 때.
+     */
+    fun setDefaultTtl(ttl: UByte?) {
+        require(ttl == null || ttl.toInt() == 0 || ttl.toInt() in 2..127) {
+            "Invalid Default TTL: $ttl (allowed: null, 0, or 2..127)"
+        }
+        defaultTTL = ttl
+    }
+
     var excluded: Boolean = false
         set(value) {
             field = value

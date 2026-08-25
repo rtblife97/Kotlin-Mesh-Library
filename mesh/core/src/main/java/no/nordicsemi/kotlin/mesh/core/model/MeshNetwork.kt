@@ -562,12 +562,29 @@ data class MeshNetwork internal constructor(
             // If a local Provisioner was moved, it's Composition Data must be cleared, as most
             // probably it will be exported to another phone, which will have its own manufacturer,
             // Elements, etc.
+            //
+            // simdo-fork (2026-08-25) — `defaultTTL = null` 제거 (양쪽 블록).
+            //
+            // 이 블록의 의도는 **Composition Data Page 0**(Mesh Profile 1.0.1 §4.2.1: CID/PID/VID/
+            // Elements) 를 지우는 것이다 — 그 값들은 "어느 폰이 이 Provisioner 노드를 들고 있는가"에
+            // 종속이라 export/import 시 무의미해지기 때문. 그런데 `defaultTTL` 은 Composition Data 가
+            // 아니라 **Foundation 계층 configuration state**(§4.2.7 Default TTL, Config Default TTL
+            // Get/Set §4.3.2.24-25) 다. 운영자가 "이 망은 홉이 깊다"고 판단해 고른 네트워크 정책이며,
+            // 폰이 바뀌어도 유지되어야 한다(주소 범위·키 인덱스가 유지되는 것과 같은 이유).
+            //
+            // 실측 회귀(신동 광산, 2026-08-25): CDB 의 provisioner 12개가 전부 defaultTTL=40 인데
+            // (nRF Mesh Android 앱에서 수동 설정) 앱이 자기 provisioner 를 local 로 올리려고
+            // `move(to = 0)` 하는 순간 구 local·신 local 양쪽의 40 이 지워졌다. 송신 TTL 우선순위는
+            // `initialTtl ?: localProvisioner.node.defaultTTL ?: networkParameters.defaultTtl` 이므로
+            // 값이 지워지면 조용히 라이브러리 기본값 5 로 떨어진다 = 최대 5홉(≈750 m). 실측 21~23홉
+            // (3,377 m) 갱도에서는 원격 노드 제어/설정이 구조적으로 불가능해진다.
+            //
+            // ∴ Composition Data 3필드 + Elements 초기화는 그대로 두고 `defaultTTL` 만 보존한다.
             if (newToIndex == 0 || from == 0) {
                 oldLocalProvisioner?.node?.apply {
                     companyIdentifier = null
                     productIdentifier = null
                     versionIdentifier = null
-                    defaultTTL = null
                     // After exporting and importing the mesh network configuration on
                     // another phone, that phone will update the local Elements array.
                     // As the final Elements count is unknown at this place, just add
@@ -587,7 +604,9 @@ data class MeshNetwork internal constructor(
                     companyIdentifier = 0x00E0u // Google
                     productIdentifier = null
                     versionIdentifier = null
-                    defaultTTL = null
+                    // simdo-fork (2026-08-25) — `defaultTTL = null` 제거. 위 블록의 근거 참조.
+                    // 새로 local 이 되는 Provisioner 의 CDB defaultTTL(예: 40)이 여기서 지워지면
+                    // 그 즉시 송신 TTL 이 networkParameters 기본값으로 떨어진다.
                     // After exporting and importing the mesh network configuration on
                     // another phone, that phone will update the local Elements array.
                     // As the final Elements count is unknown at this place, just add
