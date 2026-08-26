@@ -94,8 +94,16 @@ data class Node internal constructor(
     val uuid: Uuid,
     @SerialName(value = "name")
     private var _name: String = "nRF Mesh Node",
+    // simdo-patch (2026-08-26) — NPPI(Node Provisioning Protocol Interface, MshPRT 1.1 §3.11.8)
+    // 의 세 절차는 **전부** 노드의 Device Key 를 교체한다. 종전에는 `val` 이라 교체 수단이
+    // 없어서 "노드를 지우고 새로 add" 하는 방법밖에 없었고, 그러면 remove() 가 주소를
+    // networkExclusions 에 넣어버려(자충수) 같은 주소로 다시 add 할 수 없고 바인딩·pub·sub 도
+    // 전소실됐다. `_primaryUnicastAddress` 와 동일한 패턴(생성자 `internal var` + public 읽기
+    // 전용 프로퍼티)으로 in-place 교체를 가능하게 한다.
+    // JSON 키는 CDB 포맷 유지를 위해 @SerialName 으로 "deviceKey" 를 고정한다.
+    @SerialName(value = "deviceKey")
     @Serializable(with = KeySerializer::class)
-    val deviceKey: ByteArray?,
+    internal var _deviceKey: ByteArray?,
     @SerialName(value = "unicastAddress")
     internal var _primaryUnicastAddress: UnicastAddress,
     @SerialName(value = "elements")
@@ -108,6 +116,16 @@ data class Node internal constructor(
 
     val primaryUnicastAddress: UnicastAddress
         get() = _primaryUnicastAddress
+
+    /**
+     * 128-bit Device Key of this Node, or `null` when the key was stripped (partial export).
+     *
+     * Read-only from the outside. The only writer is
+     * [MeshNetwork.applyNodeProvisioningProtocolInterfaceResult], which runs when one of the
+     * NPPI procedures (MshPRT 1.1 §3.11.8.4-6) completes.
+     */
+    val deviceKey: ByteArray?
+        get() = _deviceKey
 
     var name: String
         get() = _name
@@ -325,7 +343,7 @@ data class Node internal constructor(
         appKeys: List<ApplicationKey>,
     ) : this(
         uuid = provisioner.uuid,
-        deviceKey = deviceKey,
+        _deviceKey = deviceKey,
         _primaryUnicastAddress = unicastAddress,
         _elements = elements.toMutableList(),
         _netKeys = netKeys.map { NodeKey(it.index, false) }.toMutableList(),
@@ -345,7 +363,7 @@ data class Node internal constructor(
     @Throws(SecurityException::class)
     internal constructor(name: String, address: Int, elements: Int) : this(
         uuid = Uuid.random(),
-        deviceKey = Crypto.generateRandomKey(),
+        _deviceKey = Crypto.generateRandomKey(),
         _primaryUnicastAddress = UnicastAddress(address),
         _elements = MutableList(elements) { Element(location = Location.UNKNOWN) },
         _netKeys = mutableListOf(NodeKey(index = 0u, _updated = false)),
@@ -378,7 +396,7 @@ data class Node internal constructor(
     ) : this(
         uuid = uuid,
         _name = name,
-        deviceKey = deviceKey,
+        _deviceKey = deviceKey,
         _primaryUnicastAddress = unicastAddress,
         _elements = MutableList(elementCount) {
             Element(
@@ -717,6 +735,54 @@ data class Node internal constructor(
     }
 
     /**
+     * simdo-patch (2026-08-26) — NPPI 전용: Element 개수만 [count] 에 맞춘다.
+     *
+     * NPPI 의 Node Address Refresh / Node Composition Refresh 는 노드의 Element 개수를 바꿀 수
+     * 있다(MshPRT 1.1 §3.11.8.5-6). 새 개수는 이번 세션의 Provisioning Capabilities PDU 의
+     * Number of Elements 필드가 권위다. Element 개수는 **주소 점유 범위**를 결정하므로
+     * Composition Data 재독해를 기다리지 않고 즉시 반영해야 한다 — 늦추면 그 사이에 다른
+     * 노드에 겹치는 주소가 배정될 수 있다.
+     *
+     * 살아남는 index 의 Element 는 **그대로 둔다**. 이후 Config Composition Data Status(Page 0)
+     * 가 도착하면 [set] 이 위치·Model ID 가 일치하는 Model 의 AppKey 바인딩·Publication·
+     * Subscription 을 새 Element 로 복사하기 때문이다(= NPPI 가 보존하기로 한 상태).
+     *
+     * @param count 새 Element 개수 (1 이상).
+     */
+    internal fun resizeElements(count: Int) {
+        require(count > 0) { "A Node must have at least one Element" }
+        while (_elements.size > count) {
+            _elements.removeAt(index = _elements.size - 1).also {
+                it.parentNode = null
+                it.index = 0
+            }
+        }
+        while (_elements.size < count) {
+            add(element = Element(location = Location.UNKNOWN))
+        }
+        network?.updateTimestamp()
+    }
+
+    /**
+     * simdo-patch (2026-08-26) — Composition Data Page 0 을 "모름" 으로 되돌린다.
+     *
+     * [isCompositionDataReceived] 가 다시 `false` 가 되어 상위 stack 이
+     * `ConfigCompositionDataGet(page = 0)` 을 재발행하도록 유도한다. NPPI 의 Node Composition
+     * Refresh 종결 시(또는 Element 개수가 바뀐 Address Refresh 시) 사용한다 — 그 시점부터
+     * CDB 가 들고 있는 Model 목록은 노드의 실제 composition 과 다를 수 있다.
+     *
+     * Element 목록 자체는 지우지 않는다. 재독해 시 [set] 이 일치하는 Model 의 설정을 복사할 수
+     * 있어야 하기 때문이다.
+     */
+    internal fun invalidateCompositionData() {
+        companyIdentifier = null
+        productIdentifier = null
+        versionIdentifier = null
+        replayProtectionCount = null
+        network?.updateTimestamp()
+    }
+
+    /**
      * Applies the result of Composition Data Status message to the Node.
      *
      * This method does nothing if the Node already was configured or the Composition Data Status
@@ -725,7 +791,13 @@ data class Node internal constructor(
      * @param compositionData The result of Config Composition Data get with Page 0.
      */
     internal fun apply(compositionData: ConfigCompositionDataStatus) {
-        val page0 = requireNotNull(compositionData.page as? Page0)
+        // simdo-patch (2026-08-26) — 종전 `requireNotNull(page as? Page0)` 는 Page 0 이 아닌
+        // Status 가 오면 예외를 던졌다. Page 128(NPPI Composition Refresh 예정 composition,
+        // MshPRT 1.1 §4.2.1.2) 디코딩을 추가하면서 이 경로로 Page128 이 들어올 수 있게 됐고,
+        // 여기서 던진 예외는 ConfigurationClientHandler → ModelEventHandler.decode() 에
+        // try/catch 가 없어 **RX 코루틴을 죽인다**. Page 128 은 아직 활성 composition 이 아니므로
+        // CDB 에 반영하면 안 된다 — 조용히 무시하는 것이 올바른 동작이다.
+        val page0 = compositionData.page as? Page0 ?: return
         companyIdentifier = page0.companyIdentifier
         productIdentifier = page0.productIdentifier
         versionIdentifier = page0.versionIdentifier

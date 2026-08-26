@@ -91,8 +91,28 @@ internal class ProvisioningData {
                 KeyDistribution -> networkKey.oldKey!!
                 else -> networkKey.key
             }
-            val data = key + networkKey.index.toByteArray() + ivIndex.index.toByteArray() +
-                    flags.rawValue.toByteArray() + unicastAddress.address.toByteArray()
+            // simdo-patch (2026-08-26) — **필드 순서 정정: Flags 가 IV Index 보다 앞이다.**
+            //
+            // MshPRT 1.1 §5.4.2.5 Provisioning Data:
+            //   NetworkKey(16) | NetKeyIndex(2) | Flags(1) | IVIndex(4) | UnicastAddress(2) = 25
+            //
+            // Zephyr(NCS v3.4.0) `provisionee.c prov_data()` 가 정확히 그 오프셋으로 읽는다:
+            //   net_idx  = sys_get_be16(&pdu[16]);
+            //   flags    =              pdu[18];
+            //   iv_index = sys_get_be32(&pdu[19]);
+            //   addr     = sys_get_be16(&pdu[23]);
+            //
+            // 종전 코드는 `… + ivIndex + flags + …` 순서라 IV Index 가 [18..21], Flags 가 [22] 에
+            // 놓였다. IV Index 0 · Key Refresh/IV Update 비활성인 망에서는 다섯 옥텟이 전부 0 이라
+            // **증상이 전혀 없다** — 지금까지 이 결함이 숨어 있던 이유다. 하지만
+            //  - IV Index 가 0 이 아니면 노드가 8비트 밀린 IV Index 를 받고,
+            //  - Key Refresh Phase 2 / IV Update 진행 중이면 Flags 가 IV Index 자리에 실린다.
+            // NPPI(§3.11.8)는 노드가 IV Index 일치를 **명시적으로 검사**하므로
+            // (`refresh_is_valid()`: `if (iv_index != bt_mesh.iv_index) return false`)
+            // IV Index 가 0 이 아닌 망에서는 세 절차 전부가 즉시 실패한다.
+            val data = key + networkKey.index.toByteArray() +
+                    flags.rawValue.toByteArray() + ivIndex.index.toByteArray() +
+                    unicastAddress.address.toByteArray()
             return Crypto.encrypt(data = data, key = keys.first, nonce = keys.second, micSize = 8)
         }
 

@@ -359,7 +359,12 @@ sealed class ProvisioningResponse {
 
             is Random -> ProvisioningPdu(1) { RANDOM.type.toByte() } + random
             is Complete -> ProvisioningPdu(1) { COMPLETE.type.toByte() }
-            is Failed -> ProvisioningPdu(2) {
+            // simdo-patch (2026-08-26) — `ProvisioningPdu(2)` 는 **타입 옥텟을 두 번** 넣어
+            // 3옥텟짜리 PDU 를 만들었다(0x09 0x09 <error>). Provisioning Failed 는 2옥텟이고
+            // ([isValid] 도 그렇게 검사한다) 다른 모든 분기는 `ProvisioningPdu(1)` 을 쓴다.
+            // 디코드 경로는 정상이었고 라이브러리가 이 PDU 를 만들 일은 없어(디바이스만 보낸다)
+            // 실사용 영향은 없었지만, 시뮬레이터/테스트가 유효하지 않은 PDU 를 만들게 된다.
+            is Failed -> ProvisioningPdu(1) {
                 FAILED.type.toByte()
             } + error.errorCode.toByte()
         }

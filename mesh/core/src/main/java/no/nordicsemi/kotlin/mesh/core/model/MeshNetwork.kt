@@ -28,6 +28,7 @@ import no.nordicsemi.kotlin.mesh.core.exception.OverlappingProvisionerRanges
 import no.nordicsemi.kotlin.mesh.core.exception.ProvisionerAlreadyExists
 import no.nordicsemi.kotlin.mesh.core.exception.SceneAlreadyExists
 import no.nordicsemi.kotlin.mesh.core.exception.SceneInUse
+import no.nordicsemi.kotlin.mesh.core.messages.NodeProvisioningProtocolInterfaceProcedure
 import no.nordicsemi.kotlin.mesh.core.model.serialization.UuidSerializer
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.ApplicationKeysConfig
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.DeviceKeyConfig
@@ -1026,6 +1027,146 @@ data class MeshNetwork internal constructor(
     }
 
     /**
+     * simdo-patch (2026-08-26) — Node Provisioning Protocol Interface (NPPI) 절차의 **종결 규칙**.
+     *
+     * MshPRT 1.1 §3.11.8 의 세 절차는 provisioning 프로토콜을 그대로 재사용하지만(같은 PDU 흐름,
+     * 같은 보안 수준) **끝났을 때 하는 일이 다르다**: 노드를 새로 만들어 넣는 것이 아니라 이미
+     * 망에 있는 노드를 *제자리에서* 갱신한다. 그래서 [remove] + [add] 조합으로는 구현할 수 없다 —
+     * [remove] 는 옛 주소를 `networkExclusions` 에 넣어 같은 주소로의 재-[add] 를 스스로 막고
+     * (자충수), 노드의 AppKey 바인딩 · Publication · Subscription · NetKey/AppKey 목록을 전부
+     * 잃는다. NPPI 가 보존하기로 약속한 바로 그 상태다.
+     *
+     * ### 절차별 종결 규칙
+     *
+     * | 절차 | Device Key | Unicast Address | Element 수 | Composition Data | NetKey/AppKey · 바인딩 · pub/sub |
+     * |---|---|---|---|---|---|
+     * | 0x00 `DEVICE_KEY_REFRESH` | **교체** | 유지 | 유지 | 유지 | **보존** |
+     * | 0x01 `NODE_ADDRESS_REFRESH` | **교체** | **변경** | Capabilities 기준 | 개수가 바뀌면 무효화 | **보존** |
+     * | 0x02 `NODE_COMPOSITION_REFRESH` | **교체** | 유지 | Capabilities 기준 | **무효화**(재독해 필요) | **보존** |
+     *
+     * 근거:
+     * - Bluetooth SIG, *Mesh Remote Provisioning* — Device Key Refresh: "Existing data such as the
+     *   node's element addresses and its lists of NetKeys and AppKeys are unaffected." /
+     *   Node Address Refresh: "Existing data such as the node's list of NetKeys and AppKeys are
+     *   unaffected." / Node Composition Refresh: "The Composition Data state of the node is updated
+     *   by the procedure, but other states are left unchanged."
+     * - Zephyr(NCS v3.4.0) 레퍼런스 구현이 정확히 이 동작을 한다: `provisioner.c prov_node_add()` →
+     *   `bt_mesh_cdb_node_key_import(node, new_dev_key)` + `bt_mesh_cdb_node_update(node, addr,
+     *   elem_count)`. 삭제·재생성 없음, exclusion 없음.
+     * - Element 개수의 권위는 이번 세션의 Provisioning Capabilities PDU 다. Nordic
+     *   `include/zephyr/bluetooth/mesh/main.h:536-547`: "Refreshing the device key and node address.
+     *   **Composition data may change, including the number of elements.**"
+     *
+     * ### 주소 교체(0x01) 시 옛 주소를 exclusion list 에 넣는 이유
+     *
+     * 노드는 주소가 바뀌는 순간 **시퀀스 번호를 0 으로 리셋**한다
+     * (`main.c bt_mesh_reprovision()`: `if (addr != primary) bt_mesh.seq = 0`). 망의 다른 노드들은
+     * 옛 주소에 대한 SeqAuth 를 Replay Protection List 에 그대로 들고 있으므로, 옛 주소를 곧바로
+     * 다른 노드에 배정하면 그 노드의 메시지가 RPL 에서 조용히 버려진다. [remove] 가 같은 이유로
+     * 같은 일을 한다 — [ExclusionList] KDoc 참조.
+     *
+     * ### Device Key 는 즉시 교체하지만 노드는 한동안 **두 키를 모두 받는다**
+     *
+     * MshPRT 1.1 §3.6.4.2 / Zephyr `app_keys.c:557-568`: 0x00 · 0x02 에서 노드는 새 Device Key 를
+     * *후보* 로만 보관하고 **새 키로 복호화에 처음 성공한 순간** 옛 키를 영구히 대체한다
+     * (0x01 은 절차 완료 즉시 활성화 — `provisionee.c reprovision_complete()`). 따라서 상위 stack 은
+     * NPPI 직후 device-key 로 암호화되는 메시지를 한 번 보내야 한다(예:
+     * `ConfigCompositionDataGet(page = 0)` — Composition Refresh 라면 어차피 필요하다).
+     * CDB 의 키를 곧바로 새 키로 바꾸는 것은 Zephyr CDB 와 동일한 선택이다.
+     *
+     * @param node           갱신 대상 노드. 이 망에 속해 있어야 한다.
+     * @param procedure      방금 완료한 NPPI 절차.
+     * @param deviceKey      provisioning 으로 새로 도출된 Device Key.
+     * @param unicastAddress 절차 종료 후 노드의 primary element 주소.
+     * @param elementCount   이번 세션 Provisioning Capabilities 의 Number of Elements.
+     * @param security       이번 세션에서 도출된 보안 수준.
+     * @throws DoesNotBelongToNetwork 노드가 이 망에 없을 때.
+     * @throws AddressAlreadyInUse    절차가 요구하는 주소 변경 규칙을 어겼을 때.
+     */
+    @Throws(DoesNotBelongToNetwork::class, AddressAlreadyInUse::class)
+    fun applyNodeProvisioningProtocolInterfaceResult(
+        node: Node,
+        procedure: NodeProvisioningProtocolInterfaceProcedure,
+        deviceKey: ByteArray,
+        unicastAddress: UnicastAddress,
+        elementCount: Int,
+        security: Security,
+    ): Unit = synchronized(nodesMonitor) {
+        require(_nodes.any { it === node }) { throw DoesNotBelongToNetwork() }
+        require(elementCount > 0) { "Number of Elements must be at least 1" }
+
+        val previousAddresses = node.addresses
+        val previousRange = node.unicastRange
+        val addressChanged = unicastAddress != node.primaryUnicastAddress
+
+        when (procedure) {
+            // §3.11.8.4 — Device Key Refresh: 주소도 composition 도 바뀌지 않는다. 노드도 같은
+            // 요구를 강제한다: `provisionee.c refresh_is_valid()` 의
+            // `valid_addr = (prov_link.addr == bt_mesh_primary_addr())`.
+            NodeProvisioningProtocolInterfaceProcedure.DEVICE_KEY_REFRESH -> {
+                require(!addressChanged) { throw AddressAlreadyInUse() }
+                require(elementCount == node.elementsCount) {
+                    "Device Key Refresh must not change the number of Elements"
+                }
+            }
+
+            // §3.11.8.5 — Node Address Refresh: 주소가 **반드시** 바뀐다. 노드는 새 주소가 옛
+            // element 범위 밖일 것을 요구한다(`refresh_is_valid()`:
+            // `addr < old_addr || addr >= old_addr + elem_count`). 우리는 한 걸음 더 나아가 범위
+            // 전체의 비중첩을 요구한다 — 부분 중첩은 옛/새 주소가 동시에 유효해 보이는 구간을
+            // 만들고, 그 구간을 exclusion list 에 넣으면 새 주소까지 같이 막힌다.
+            NodeProvisioningProtocolInterfaceProcedure.NODE_ADDRESS_REFRESH -> {
+                require(addressChanged) { throw AddressAlreadyInUse() }
+                require(
+                    !UnicastRange(
+                        address = unicastAddress,
+                        elementsCount = elementCount,
+                    ).overlaps(other = previousRange)
+                ) { throw AddressAlreadyInUse() }
+            }
+
+            // §3.11.8.6 — Node Composition Refresh: composition 만 바뀌고 주소는 유지된다.
+            // 노드 쪽 검사도 Device Key Refresh 와 동일하다.
+            NodeProvisioningProtocolInterfaceProcedure.NODE_COMPOSITION_REFRESH -> {
+                require(!addressChanged) { throw AddressAlreadyInUse() }
+            }
+        }
+
+        // --- 공통: Device Key 교체 (세 절차 모두) ---
+        node._deviceKey = deviceKey
+        node.security = security
+
+        // --- Element 개수 반영 (0x01 / 0x02 에서만 바뀔 수 있다) ---
+        val elementCountChanged = elementCount != node.elementsCount
+        if (elementCountChanged) {
+            node.resizeElements(count = elementCount)
+        }
+
+        // --- 주소 이동 (0x01) ---
+        if (addressChanged) {
+            node._primaryUnicastAddress = unicastAddress
+            // 옛 범위는 IV Index 가 2 오를 때까지 재사용 금지. remove() 와 같은 근거.
+            _networkExclusions.add(
+                ExclusionList(ivIndex = ivIndex.index).apply {
+                    network = this@MeshNetwork
+                    previousAddresses.forEach { exclude(address = it) }
+                }
+            )
+        }
+
+        // --- Composition Data 무효화 ---
+        // 0x02 는 정의상 composition 이 바뀐다. 0x01 은 "바뀔 수 있다" 이므로 Element 개수가 실제로
+        // 달라졌을 때만 무효화한다(순수 재배치라면 CDB 의 Model 목록은 그대로 유효하다).
+        if (procedure == NodeProvisioningProtocolInterfaceProcedure.NODE_COMPOSITION_REFRESH ||
+            elementCountChanged
+        ) {
+            node.invalidateCompositionData()
+        }
+
+        updateTimestamp()
+    }
+
+    /**
      * Adds a given [Group] to the list of groups in the mesh network.
      *
      * @param group Group to be removed.
@@ -1178,15 +1319,27 @@ data class MeshNetwork internal constructor(
     /**
      * Checks if the address range is available for use.
      *
-     * @param range Unicast range to check.
+     * @param range    Unicast range to check.
+     * @param ignoring Node whose own address occupancy must be ignored, or `null`.
+     *                 **NPPI 전용** — Node Provisioning Protocol Interface 절차
+     *                 (MshPRT 1.1 §3.11.8)는 이미 망에 있는 노드를 *제자리에서* 갱신하므로,
+     *                 대상 노드 자신이 그 주소를 쓰고 있다는 사실이 "사용 중"으로 판정되면
+     *                 Device Key Refresh / Composition Refresh 가 시작조차 못 한다
+     *                 (두 절차는 주소를 **유지**해야 한다). 신규 장치 프로비저닝 경로는
+     *                 `null` 을 그대로 쓴다 = 종전 동작 그대로.
      * @return true if the given address range is available for use or false otherwise.
      */
     // simdo-fork (2026-06-08, P6) — _nodes raw 순회를 nodesMonitor 아래로. add() 가 이 함수를 호출할 때
     // 이미 monitor 를 잡고 있어 재진입(JVM monitor reentrant)으로 안전. _networkExclusions 는 _nodes 와
     // 무관한 별 컬렉션이라 monitor 밖 평가도 무방하나, 단일 식이라 한 블록에 둔다.
-    fun isAddressRangeAvailable(range: UnicastRange) = synchronized(nodesMonitor) {
-        _nodes.none { it.containsElementsWithAddress(range) }
-    } && !_networkExclusions.contains(range, ivIndex)
+    @JvmOverloads
+    fun isAddressRangeAvailable(range: UnicastRange, ignoring: Node? = null) =
+        synchronized(nodesMonitor) {
+            _nodes.none { it !== ignoring && it.containsElementsWithAddress(range) }
+            // networkExclusions 는 **일부러** self-exclusion 대상이 아니다. 망에 살아 있는 노드의
+            // 주소가 exclusion list 에 들어 있다면 그건 CDB 불일치이고, 그 상태로 NPPI 를 강행하면
+            // 다른 노드가 곧 그 주소를 배정받아 충돌한다. 실패하는 편이 옳다.
+        } && !_networkExclusions.contains(range, ivIndex)
 
     /**
      * Checks if the address is available to be assigned to a node with the given number of
@@ -1194,14 +1347,18 @@ data class MeshNetwork internal constructor(
      *
      * @param address         Possible address of the primary element of the node.
      * @param elementCount    Element count.
+     * @param ignoring        Node whose own occupancy is ignored — see
+     *                        [isAddressRangeAvailable].
      * @return true if the address is available to be assigned to a node with given number of
      *         elements or false otherwise.
      */
-    fun isAddressAvailable(address: UnicastAddress, elementCount: Int) =
+    @JvmOverloads
+    fun isAddressAvailable(address: UnicastAddress, elementCount: Int, ignoring: Node? = null) =
         isAddressRangeAvailable(
             range = UnicastRange(
                 address = address, elementsCount = elementCount
-            )
+            ),
+            ignoring = ignoring,
         )
 
     /**
@@ -1537,7 +1694,7 @@ data class MeshNetwork internal constructor(
         when (config) {
             is NodesConfig.All -> if (config.deviceKeyConfig == DeviceKeyConfig.EXCLUDE_KEY) {
                 _nodes = _nodes.map { node ->
-                    node.copy(deviceKey = null)
+                    node.copy(_deviceKey = null)
                 }.toMutableList()
             } else _nodes
 
@@ -1549,7 +1706,7 @@ data class MeshNetwork internal constructor(
                 val withoutDeviceKey = _nodes.filter { node ->
                     node in config.withoutDeviceKey
                 }.map { node ->
-                    node.copy(deviceKey = null)
+                    node.copy(_deviceKey = null)
                 }.toMutableList()
 
                 _nodes.clear()

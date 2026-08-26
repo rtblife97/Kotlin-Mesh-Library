@@ -132,10 +132,16 @@ sealed class OobType(val rawValue: UByte) {
 
     internal companion object {
 
-        private val oobTypes = listOf(
-            StaticOobInformationAvailable,
-            OnlyOobAuthenticatedProvisioningSupported
-        )
+        // simdo-patch (2026-08-26) — `val` → `get()`. sealed class 의 nested object 를
+        // companion 보다 **먼저** 만지면 JVM 클래스 초기화가 순환에 걸려 이 리스트의 원소가
+        // `null` 이 되고(같은 스레드에서 초기화 진행 중인 object 의 `INSTANCE` 를 기다리지 않고
+        // 그대로 읽는다), 이후 `from()` 이 프로세스 내내 NPE 를 던진다.
+        // 자세한 설명은 `Algorithms.Companion.algorithms` 주석 참조.
+        private val oobTypes: List<OobType>
+            get() = listOf(
+                StaticOobInformationAvailable,
+                OnlyOobAuthenticatedProvisioningSupported
+            )
 
         /**
          * Returns the supported oob types based on the give value.
@@ -194,7 +200,13 @@ sealed class OutputOobActions(val rawValue: UShort) {
     }
 
     internal companion object {
-        private val actions = listOf(Blink, Beep, Vibrate, OutputNumeric, OutputAlphanumeric)
+        // simdo-patch (2026-08-26) — `val` → `get()`. sealed class 의 nested object 를
+        // companion 보다 **먼저** 만지면 JVM 클래스 초기화가 순환에 걸려 이 리스트의 원소가
+        // `null` 이 되고(같은 스레드에서 초기화 진행 중인 object 의 `INSTANCE` 를 기다리지 않고
+        // 그대로 읽는다), 이후 `from()` 이 프로세스 내내 NPE 를 던진다.
+        // 자세한 설명은 `Algorithms.Companion.algorithms` 주석 참조.
+        private val actions: List<OutputOobActions>
+            get() = listOf(Blink, Beep, Vibrate, OutputNumeric, OutputAlphanumeric)
 
         /**
          * Returns the list supported OutputOobActions from a given Output OOB Actions value.
@@ -248,7 +260,13 @@ sealed class InputOobActions(val rawValue: UShort) {
     }
 
     internal companion object {
-        private val actions = listOf(Push, Twist, InputNumeric, InputAlphanumeric)
+        // simdo-patch (2026-08-26) — `val` → `get()`. sealed class 의 nested object 를
+        // companion 보다 **먼저** 만지면 JVM 클래스 초기화가 순환에 걸려 이 리스트의 원소가
+        // `null` 이 되고(같은 스레드에서 초기화 진행 중인 object 의 `INSTANCE` 를 기다리지 않고
+        // 그대로 읽는다), 이후 `from()` 이 프로세스 내내 NPE 를 던진다.
+        // 자세한 설명은 `Algorithms.Companion.algorithms` 주석 참조.
+        private val actions: List<InputOobActions>
+            get() = listOf(Push, Twist, InputNumeric, InputAlphanumeric)
 
         /**
          * Returns the list supported InputOobActions from a given provisioning pdu.

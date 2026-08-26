@@ -90,14 +90,32 @@ object Crypto {
     }
 
     /**
+     * The provisioning protocol always uses the NIST P-256 (secp256r1) curve, for **both**
+     * `BTM_ECDH_P256_CMAC_AES128_AES_CCM` and `BTM_ECDH_P256_HMAC_SHA256_AES_CCM` — the names
+     * say so, and MshPRT 1.1 §5.4.2.3 fixes the curve.
+     */
+    private const val ECDH_P256_KEY_SIZE = 256
+
+    /**
      * Generates a pair of Private and Public Keys using P256 Elliptic Curve.
-     * @param algorithm Algorithm to use.
+     *
+     * simdo-patch (2026-08-26) — 종전에는 `initialize(algorithm.length)` 였다.
+     * [Algorithm.length] 는 **곡선 크기가 아니라** confirmation / random 값의 길이
+     * (128 또는 256 bit)다. 따라서 `BTM_ECDH_P256_CMAC_AES128_AES_CCM` 을 고르면 EC 생성기에
+     * 128 이 들어가 BouncyCastle 이 `InvalidParameterException: unknown key size` 를 던졌다 —
+     * 즉 **그 알고리즘만 지원하는 장치는 프로비저닝 자체가 불가능**했다. 그 알고리즘은 Mesh
+     * Protocol 1.1 에서 mandatory 이고, Mesh Profile 1.0 장치는 그것만 지원한다.
+     * 두 알고리즘을 다 광고하는 장치에서는 `strongest()` 가 SHA-256(=256)을 골라
+     * 우연히 동작했기 때문에 오래 숨어 있었다.
+     *
+     * @param algorithm Algorithm to use. Kept for API compatibility — the curve is fixed.
      * @return KeyPair
      */
+    @Suppress("UNUSED_PARAMETER")
     fun generateKeyPair(algorithm: Algorithm): KeyPair = KeyPairGeneratorSpi
         .ECDH()
         .run {
-            initialize(algorithm.length)
+            initialize(ECDH_P256_KEY_SIZE)
             generateKeyPair()
         }
 

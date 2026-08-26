@@ -106,7 +106,28 @@ sealed class Algorithms(val rawValue: UShort) {
 
     companion object {
 
-        val algorithms = listOf(BtmEcdhP256CmacAes128AesCcm, BtmEcdhP256HmacSha256AesCcm)
+        /**
+         * simdo-patch (2026-08-26) — `val` → `get()`.
+         *
+         * 종전 `val algorithms = listOf(BtmEcdhP256CmacAes128AesCcm, …)` 는 클래스 초기화
+         * 순환에 걸려 **원소가 `null` 인 리스트**가 될 수 있었다:
+         *
+         * 1. 누군가 `Algorithms.BtmEcdhP256CmacAes128AesCcm` 을 먼저 만진다,
+         * 2. JVM 이 그 object 의 `<clinit>` 을 시작하고, 상위 클래스 `Algorithms` 를 먼저
+         *    초기화해야 하므로 `Algorithms.<clinit>` 으로 들어간다,
+         * 3. 거기서 companion 이 `listOf(BtmEcdhP256CmacAes128AesCcm, …)` 를 평가하는데
+         *    그 object 는 **같은 스레드에서 초기화 진행 중**이라 JVM 이 기다리지 않고
+         *    `INSTANCE == null` 을 그대로 돌려준다,
+         * 4. 리스트에 null 이 박히고 **프로세스가 살아 있는 내내** 그대로 남는다.
+         *
+         * 증상은 그 다음 [from] 호출에서 `NullPointerException: Cannot invoke
+         * Algorithms.getRawValue() because "it" is null` — 즉 Provisioning Capabilities
+         * 파싱이 통째로 죽는다. companion 을 먼저 만지는 순서(= 지금까지의 실사용 경로)에서는
+         * 증상이 없어 오래 숨어 있었다. getter 로 만들면 두 object 가 모두 완전히 초기화된
+         * 뒤에 평가되므로 순서에 무관해진다.
+         */
+        val algorithms: List<Algorithms>
+            get() = listOf(BtmEcdhP256CmacAes128AesCcm, BtmEcdhP256HmacSha256AesCcm)
 
         /**
          * Returns the list supported algorithms.

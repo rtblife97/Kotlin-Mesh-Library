@@ -97,7 +97,13 @@ sealed class PublicKeyType(val rawValue: UByte) {
     }
 
     companion object {
-        val publicKeyTypes = listOf(PublicKeyOobInformationAvailable)
+        // simdo-patch (2026-08-26) — `val` → `get()`. sealed class 의 nested object 를
+        // companion 보다 **먼저** 만지면 JVM 클래스 초기화가 순환에 걸려 이 리스트의 원소가
+        // `null` 이 되고(같은 스레드에서 초기화 진행 중인 object 의 `INSTANCE` 를 기다리지 않고
+        // 그대로 읽는다), 이후 `from()` 이 프로세스 내내 NPE 를 던진다.
+        // 자세한 설명은 `Algorithms.Companion.algorithms` 주석 참조.
+        val publicKeyTypes: List<PublicKeyType>
+            get() = listOf(PublicKeyOobInformationAvailable)
 
         /**
          * Returns the name of the given public key type.
