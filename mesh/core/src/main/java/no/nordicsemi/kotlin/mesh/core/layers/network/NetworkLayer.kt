@@ -48,7 +48,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
     private val secureProperties
         get() = networkManager.securePropertiesStorage
     internal var proxyNetworkKey: NetworkKey? = null
-    private val networkMessageCache = mutableMapOf<ByteArray, Any?>()
+    // simdo-patch (2026-09-09): was `mutableMapOf<ByteArray, Any?>()`. ByteArray keys compare by
+    // identity, so the cache never hit and never evicted. See NetworkMessageCache for the design.
+    internal val networkMessageCache = NetworkMessageCache()
 
     /**
      * This method handles the received PDU of given type and passes it to Upper Transport Layer.
@@ -62,12 +64,12 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
 
         // Secure Network Beacons can repeat whenever the device connects to a new Proxy.
         if (type != PduType.MESH_BEACON) {
-            // Ensure the PDU has not been handled already.
-            require(networkMessageCache[incomingPdu] == null) {
+            // Ensure the PDU has not been handled already (Network Message Cache, stage 1:
+            // byte-identical repeats such as Network Transmit copies).
+            require(!networkMessageCache.isDuplicateRawPdu(incomingPdu)) {
                 logger?.d(LogCategory.NETWORK) { "PDU already handled" }
                 return null
             }
-            networkMessageCache[incomingPdu] = null
         }
 
         // Try decoding the pdu.
@@ -79,6 +81,17 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                     meshNetwork = meshNetwork
                 )
                 return if (networkPdu != null) {
+                    // Network Message Cache, stage 2 (Section 3.4.6.4): relay copies carry a
+                    // decremented TTL and therefore different wire bytes, so they pass stage 1.
+                    // Identify them by SRC + IV Index + SEQ after decoding.
+                    require(!networkMessageCache.isDuplicateSequence(networkPdu)) {
+                        logger?.d(LogCategory.NETWORK) {
+                            "Duplicate Network PDU (src: " +
+                                    "${networkPdu.source.address.toHexString()}, " +
+                                    "seq: ${networkPdu.sequence}) found in Network Message Cache"
+                        }
+                        return null
+                    }
                     logger?.i(LogCategory.NETWORK) { "$networkPdu received" }
                     networkManager.lowerTransportLayer.handle(networkPdu = networkPdu)?.let {
                         // simdo-patch: capture sequence/ivIndex/ttl from the Network PDU.
