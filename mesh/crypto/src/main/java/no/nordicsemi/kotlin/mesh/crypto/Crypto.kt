@@ -39,7 +39,12 @@ import kotlin.uuid.Uuid
 
 object Crypto {
     private val secureRandom = SecureRandom()
-    private val blockCipher: BlockCipher = AESEngine.newInstance()
+    /**
+     * AES 엔진은 호출마다 새로 만든다 (2026-09-29 fork 수정). 종전에는 엔진 하나를 모든 CCM·CMAC 호출이 공유해
+     * 여러 스레드(설정 링크 여럿 + 프로비저닝 + 광고 해석)가 동시에 쓰면 `init(key)` 가 서로의 키 상태를 덮어
+     * 정상 PDU 복호 실패·잘못된 암호문(조명 측 `Decryption failed`)이 났다. BouncyCastle 엔진은 스레드 안전하지 않다.
+     */
+    private fun newAesEngine(): BlockCipher = AESEngine.newInstance()
     private val SALT_KEY = ByteArray(16)
     private val smk2 = "smk2".encodeToByteArray()
     private val smk3 = "smk3".encodeToByteArray()
@@ -627,7 +632,7 @@ object Crypto {
      */
     private fun calculateCmac(input: ByteArray, key: ByteArray): ByteArray {
         require(key.size == 16) { "Key must be 128-bits" }
-        return CMac(blockCipher).run {
+        return CMac(newAesEngine()).run {
             init(KeyParameter(key))
             update(input, 0, input.count())
             val output = ByteArray(macSize) { 0x00 }
@@ -682,7 +687,7 @@ object Crypto {
         additionalData: ByteArray? = null,
         micSize: Int,
         mode: Boolean,
-    ) = CCMBlockCipher.newInstance(blockCipher).run {
+    ) = CCMBlockCipher.newInstance(newAesEngine()).run {
         val ccm = ByteArray(if (mode) data.size + micSize else data.size - micSize)
         init(mode, AEADParameters(KeyParameter(key), micSize * 8, nonce, additionalData))
         processBytes(data, 0, data.size, ccm, data.size)
