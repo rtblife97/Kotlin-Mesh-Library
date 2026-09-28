@@ -434,10 +434,12 @@ internal class NetworkManager internal constructor(
         destination: Address,
         responseOpcode: UInt,
         timeout: Duration,
+        matches: (BaseMeshMessage) -> Boolean = { true },
     ) = awaitMeshMessageResponse(
         destination = MeshAddress.create(destination),
         responseOpcode = responseOpcode,
-        timeout = timeout
+        timeout = timeout,
+        matches = matches,
     )
 
     /**
@@ -449,6 +451,11 @@ internal class NetworkManager internal constructor(
      * 구독 전에 도착한 응답은 사라진다. 실기기 2026-09-28 14:46:22: 2분할 ConfigAppKeyAdd 의 Status 가 송신 함수
      * (마지막 분할 뒤 분할 간격만큼 기다림) 반환보다 몇 ms 먼저 도착해 수신·복호까지 됐는데도 15 s 타임아웃.
      *
+     * simdo-fork (2026-09-29) — [matches]: 응답이 **그 요청의** 응답인지 파라미터까지 본다 (요청 파라미터를 되돌려 주는 Config Status
+     * — [no.nordicsemi.kotlin.mesh.core.layers.access.responseMatchesRequest]). 종전에는 (보낸 주소, 응답 opcode) 만 비교해, 앞 요청의
+     * 늦은 응답(앱이 포기한 뒤 lib 재전송이 받아 낸 것)이 다음 요청의 성공으로 기록됐다 (실기기 2026-09-28 17:57:11.259 — app0·0x1000
+     * Bind Status 가 bind(app1, 0x1000) 의 응답이 됨).
+     *
      * @param destination Destination address of the message.
      * @param timeout     Timeout duration.
      */
@@ -456,10 +463,12 @@ internal class NetworkManager internal constructor(
         destination: MeshAddress,
         responseOpcode: UInt,
         timeout: Duration,
+        matches: (BaseMeshMessage) -> Boolean = { true },
     ): ReceivedMessage? = try {
         withTimeout(timeout) {
             incomingMeshMessages.first {
-                destination == it.source && responseOpcode == (it.message as? HasOpCode)?.opCode
+                destination == it.source && responseOpcode == (it.message as? HasOpCode)?.opCode &&
+                    matches(it.message)
             }
         }
     } catch (e: TimeoutCancellationException) {

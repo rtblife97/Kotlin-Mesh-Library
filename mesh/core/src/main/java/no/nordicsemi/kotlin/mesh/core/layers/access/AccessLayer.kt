@@ -7,6 +7,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import no.nordicsemi.kotlin.mesh.core.ModelEvent
@@ -200,17 +202,33 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
         val accessPdu = AccessPdu.init(pdu = upperTransportPdu) ?: return null
         var request: AcknowledgedMeshMessage? = null
 
-        val index = mutex.withLock {
-            reliableMessageContexts.indexOfFirst {
+        val candidates = mutex.withLock {
+            reliableMessageContexts.filter {
                 it.source == upperTransportPdu.destination.address &&
                         it.request.responseOpCode == accessPdu.opCode &&
                         it.destination == upperTransportPdu.source
             }
         }
 
-        if (upperTransportPdu.destination is UnicastAddress && index > -1) {
+        // simdo-fork (2026-09-29) — 같은 (주소, 응답 opcode) 를 기다리는 문맥 중 **파라미터까지 맞는** 것만 이 응답의 요청이다
+        // ([responseMatchesRequest]). 안 맞으면(앞 요청의 늦은 응답) 어떤 문맥도 지우지 않는다 — 기다리는 요청의 재전송이 계속되고,
+        // 늦은 응답은 요청 없이(= CDB 반영 없이) 전달된다. 종전: 첫 문맥을 지우고 그 요청으로 CDB 를 고쳤다.
+        val context = if (upperTransportPdu.destination is UnicastAddress && candidates.isNotEmpty()) {
+            val decoded = decodeForMatching(accessPdu = accessPdu, keySet = keySet)
+            candidates.firstOrNull { decoded == null || responseMatchesRequest(it.request, decoded) }
+                .also {
+                    if (it == null) {
+                        logger?.w(LogCategory.ACCESS) {
+                            "$accessPdu 의 파라미터가 기다리는 요청(${candidates.size})과 다름 — 늦게 온 앞 요청의 응답으로 보고 " +
+                                "요청 문맥을 유지 ($decoded)"
+                        }
+                    }
+                }
+        } else null
+
+        if (context != null) {
             mutex.withLock {
-                val context = reliableMessageContexts.removeAt(index)
+                reliableMessageContexts.remove(context)
                 request = context.request
                 context.invalidate()
             }
@@ -291,12 +309,14 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
 
         // If ack is null, the message is not acknowledged, hence return null
         return sendThenAwait(
+            context = ack,
             awaitResponse = ack?.let {
                 {
                     networkManager.awaitMeshMessageResponse(
                         destination = destination,
                         responseOpcode = it.request.responseOpCode,
-                        timeout = it.timeout
+                        timeout = it.timeout,
+                        matches = { response -> responseMatchesRequest(it.request, response) },
                     )
                 }
             },
@@ -314,12 +334,29 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
      * `UNDISPATCHED` 로 시작하면 [NetworkManager.awaitMeshMessageResponse] 가 첫 suspend 전에 SharedFlow 에 구독한다.
      */
     private suspend fun sendThenAwait(
+        context: AcknowledgementContext?,
         awaitResponse: (suspend () -> ReceivedMessage?)?,
         send: suspend () -> Unit,
-    ): MeshMessage? = coroutineScope {
-        val response = awaitResponse?.let { async(start = CoroutineStart.UNDISPATCHED) { it() } }
-        send()
-        response?.await()?.message as? MeshMessage
+    ): MeshMessage? = try {
+        coroutineScope {
+            val response = awaitResponse?.let { async(start = CoroutineStart.UNDISPATCHED) { it() } }
+            send()
+            response?.await()?.message as? MeshMessage
+        }
+    } finally {
+        // simdo-fork (2026-09-29) — 이 요청을 기다리던 쪽이 끝났다(응답·시간 초과·호출자 취소). 응답이면 [handle] 이 이미 문맥을
+        // 지웠다. 아니면 여기서 지워 **재전송을 멈춘다**. 종전: 앱이 15 s 에 포기해도(호출자 withTimeout 취소) 문맥의 재전송 타이머가
+        // 30 s 까지 계속 보냈고, 그 늦은 응답이 다음 요청에 붙었다(실기기 2026-09-28 17:59:26.798 — 앱 포기 0.36 s 뒤 도착).
+        // lib 자체 시간 초과 경로의 cancel(handle) 은 문맥을 찾지 못해(조건이 뒤집혀 있었다 — [cancel]) 목록에 남았다.
+        if (context != null) {
+            withContext(NonCancellable) {
+                val removed = mutex.withLock { reliableMessageContexts.remove(context) }
+                if (removed) {
+                    context.invalidate()
+                    logger?.i(LogCategory.ACCESS) { "${context.request} 응답 대기 끝(응답 없음) — 재전송 중단" }
+                }
+            }
+        }
     }
 
     /**
@@ -372,11 +409,13 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
         )
 
         return sendThenAwait(
+            context = ack,
             awaitResponse = {
                 networkManager.awaitMeshMessageResponse(
                     destination = destination,
                     responseOpcode = ack.request.responseOpCode,
-                    timeout = ack.timeout
+                    timeout = ack.timeout,
+                    matches = { response -> responseMatchesRequest(ack.request, response) },
                 )
             },
             send = { networkManager.upperTransportLayer.send(accessPdu = pdu, ttl = initialTtl, keySet = keySet) },
@@ -460,10 +499,13 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
         }
 
         mutex.withLock {
+            // simdo-fork (2026-09-29) — 조건 정정. 문맥의 source = 로컬(보낸 쪽), destination = 대상, 그리고 handle 은 **요청** 의
+            // opCode 를 준다. 종전 조건(source==handle.destination, responseOpCode==handle.opCode)은 한 번도 맞지 않아, lib 시간
+            // 초과 뒤에도 문맥이 목록에 남았다(타이머만 멈춤) → 뒤에 온 같은 opcode 응답이 그 옛 요청에 붙을 수 있었다.
             reliableMessageContexts.indexOfFirst {
-                it.source == handle.destination.address &&
-                        it.request.responseOpCode == handle.opCode &&
-                        it.destination == handle.source.address
+                it.source == handle.source.address &&
+                        it.request.opCode == handle.opCode &&
+                        it.destination == handle.destination.address
             }.takeIf { it > -1 }?.let {
                 reliableMessageContexts.removeAt(index = it).invalidate()
             }
@@ -661,6 +703,22 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
         // To add support to any new message, create a ModelEventHandler and add it to the local
         // Element.
         return newMessage ?: UnknownMessage(accessPdu = accessPdu)
+    }
+
+    /**
+     * simdo-fork (2026-09-29) — 요청·응답 짝짓기용 디코드 (부수효과 없음). [handle] 의 디코드와 같은 모델 집합을 쓴다
+     * (AccessKeySet 이면 DeviceKey 가 필요 없는 모델, 아니면 DeviceKey 모델). 디코드 못 하면 null — 그때는 종전처럼 첫 문맥.
+     */
+    private suspend fun decodeForMatching(accessPdu: AccessPdu, keySet: KeySet): MeshMessage? {
+        val localNode = network.localProvisioner?.node ?: return null
+        val models = localNode.elements.flatMap { it.models }.filter {
+            if (keySet is AccessKeySet) !it.requiresDeviceKey else it.supportsDeviceKey
+        }
+        for (model in models) {
+            val handler = model.eventHandler ?: continue
+            return handler.decode(accessPdu = accessPdu) ?: continue
+        }
+        return null
     }
 
     /**
