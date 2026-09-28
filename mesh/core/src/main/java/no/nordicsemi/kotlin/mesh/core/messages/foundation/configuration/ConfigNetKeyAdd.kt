@@ -39,9 +39,10 @@ class ConfigNetKeyAdd(
         require(key.size == 16) { throw InvalidKeyLength() }
     }
 
+    // simdo-fork (2026-09-29) — 키 값은 로그에 남기지 않는다 (길이만).
     override fun toString(): String =
         "ConfigNetKeyAdd(networkKeyIndex: $networkKeyIndex, " +
-        "key: 0x${key.toHexString(HexFormat.UpperCase)})"
+        "key: <${key.size}B 숨김>)"
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

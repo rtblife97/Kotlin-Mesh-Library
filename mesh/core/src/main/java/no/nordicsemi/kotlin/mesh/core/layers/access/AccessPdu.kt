@@ -48,25 +48,37 @@ internal data class AccessPdu(
         } ?: 0
 
     @OptIn(ExperimentalStdlibApi::class)
-    override fun toString() = "Access PDU (" +
-            "opCode: ${
-                opCode.toHexString(format = HexFormat {
-                    number {
-                        prefix = "0x"
-                        minLength = 2
-                        removeLeadingZeros = true
-                        upperCase = true
-                    }
-                })
-            }" + (
-                parameters
-                    .takeIf { it.isNotEmpty() }
-                    ?.let { ", parameters: 0x${parameters.toHexString(HexFormat.UpperCase)})"}
-                    ?: ")"
+    override fun toString(): String {
+        val hex = HexFormat.UpperCase
+        val opCodeText = opCode.toHexString(format = HexFormat {
+            number {
+                prefix = "0x"
+                minLength = 2
+                removeLeadingZeros = true
+                upperCase = true
+            }
+        })
+        // simdo-fork (2026-09-29) — 키 자료를 싣는 메시지(AppKey/NetKey Add·Update)는 키 바이트를 로그에 남기지 않는다. 키 앞의 인덱스
+        // 바이트는 식별에 필요하므로 남긴다. logcat 은 다른 앱·bugreport 로 새어 나간다.
+        val keyAt = keyMaterialOffset(opCode)
+        if (keyAt != null && parameters.size > keyAt) {
+            val opLen = accessPdu.size - parameters.size
+            val opBytes = if (opLen > 0) accessPdu.copyOfRange(0, opLen) else byteArrayOf()
+            val indexBytes = parameters.copyOfRange(0, keyAt).toHexString(hex)
+            val hidden = parameters.size - keyAt
+            return "Access PDU (opCode: $opCodeText, parameters: 0x$indexBytes + <키 ${hidden}B 숨김>)" +
+                " [raw=0x${opBytes.toHexString(hex)}$indexBytes + <키 ${hidden}B 숨김>]"
+        }
+        return "Access PDU (opCode: $opCodeText" + (
+            parameters
+                .takeIf { it.isNotEmpty() }
+                ?.let { ", parameters: 0x${parameters.toHexString(hex)})" }
+                ?: ")"
             ) +
             // simdo-fork (2026-05-18) — raw accessPdu byte logging for opcode parsing 진단.
             // LightLcModeStatus 응답이 0xFF94 로 decode 되는 root cause 추적용.
-            " [raw=0x${accessPdu.toHexString(HexFormat.UpperCase)}]"
+            " [raw=0x${accessPdu.toHexString(hex)}]"
+    }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -97,6 +109,17 @@ internal data class AccessPdu(
     }
 
     internal companion object {
+
+        /**
+         * simdo-fork (2026-09-29) — 매개변수에 키 자료가 들어 있는 opcode 면 키가 시작하는 위치(그 앞은 키 인덱스), 아니면 null.
+         * Mesh Protocol §4.3.4 (구 Mesh Profile 1.0.1 §4.3.2): Config AppKey Add 0x00 / Update 0x01 = NetKeyIndex·AppKeyIndex 3 B + AppKey
+         * 16 B, Config NetKey Add 0x8040 / Update 0x8045 = NetKeyIndex 2 B + NetKey 16 B.
+         */
+        fun keyMaterialOffset(opCode: UInt): Int? = when (opCode) {
+            0x00u, 0x01u -> 3
+            0x8040u, 0x8045u -> 2
+            else -> null
+        }
 
         /**
          * Constructs an AccessPDu using the given UpperTransportPdu.

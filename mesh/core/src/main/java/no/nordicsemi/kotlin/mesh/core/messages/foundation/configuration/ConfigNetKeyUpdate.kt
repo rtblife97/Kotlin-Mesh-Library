@@ -69,8 +69,9 @@ class ConfigNetKeyUpdate(
         return result
     }
 
+    // simdo-fork (2026-09-29) — 키 값은 로그에 남기지 않는다 (길이만).
     override fun toString(): String = "ConfigNetKeyUpdate(networkKeyIndex: $networkKeyIndex, " +
-            "key: 0x${newKey.toHexString(HexFormat.UpperCase)})"
+            "key: <${newKey.size}B 숨김>)"
 
     companion object Initializer : ConfigMessageInitializer {
         override val opCode = 0x8045u

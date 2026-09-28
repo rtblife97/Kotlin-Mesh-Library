@@ -52,8 +52,9 @@ class ConfigAppKeyAdd(
         require(key.size == 16) { throw InvalidKeyLength() }
     }
 
+    // simdo-fork (2026-09-29) — 키 값은 로그에 남기지 않는다 (길이만).
     override fun toString() = "ConfigAppKeyAdd(networkKeyIndex: $networkKeyIndex, " +
-            "applicationKeyIndex: $applicationKeyIndex, key: 0x${key.toHexString(HexFormat.UpperCase)})"
+            "applicationKeyIndex: $applicationKeyIndex, key: <${key.size}B 숨김>)"
 
     companion object Initializer : ConfigMessageInitializer {
         override val opCode = 0x00u
