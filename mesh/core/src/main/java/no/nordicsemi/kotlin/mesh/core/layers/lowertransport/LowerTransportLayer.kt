@@ -887,6 +887,7 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
                 remainingNumberOfRetransmissions > 0u &&
                         remainingNumberOfUnicastRetransmissionsWithoutProgress > 0u
             ) {
+                SarDiagnostics.unicastGiveUps.incrementAndGet()
                 scope.launch {
                     cancelTransmissionOfSegments(
                         destination = destination,
@@ -913,6 +914,10 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
                         .toUByte()
                 )
             scope.launch {
+                // simdo 2026-09-28: 진단 카운터 — 이번 재전송에서 다시 보내는 분할 수.
+                SarDiagnostics.unicastSegmentRetransmissions.addAndGet(
+                    (outgoingSegments[sequenceZero]?.segments?.unacknowledged()?.size ?: 0).toLong()
+                )
                 // Send again unacknowledged segments and restart the timer.
                 sendSegments(sequenceZero)
             }
