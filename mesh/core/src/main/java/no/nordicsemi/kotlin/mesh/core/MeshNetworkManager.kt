@@ -7,6 +7,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
@@ -125,19 +126,39 @@ class MeshNetworkManager(
 
     internal var networkManager: NetworkManager? = null
         private set(value) {
-            field = value
-            value?.let {
-                observeNetworkManagerEvents()
-                observeMeshMessages()
-            } ?: run {
-                // Cancel the observers when the network manager is set to null, which happens when
-                // the network is cleared.
-                networkManagerEventObserver?.cancel()
+            // simdo-fork (2026-09-28) — 교체 시 옛 스택 정리.
+            //
+            // 종전: 새 인스턴스를 대입만 했다. 옛 인스턴스의 bearer collector 는 살아 남아 두 스택이 같은 PDU 를
+            // 처리했고(이중 수신·이중 SAR ACK·이중 Proxy Filter 설정), 관찰자(observeNetworkManagerEvents /
+            // observeMeshMessages)는 "null 일 때만 구독" 이라 **옛 인스턴스** flow 에 계속 붙어 있었다(새
+            // 인스턴스가 받은 메시지는 networkEvents 로 나가지 않고, 옛 스택이 대신 처리해서 가려졌다). 새
+            // 인스턴스에는 bearer 도 없어서 앱이 NetworkUpdated 때 다시 물려 줄 때까지 수신 공백이 있었다.
+            //
+            // 순서: ① 새 인스턴스가 현재 bearer·per-dest 등록을 넘겨받아 구독을 마친다 → ② 관찰자를 새 인스턴스로
+            // 옮긴다 → ③ 옛 인스턴스를 은퇴시킨다(진행 중 송신이 없으면 즉시 수신 종료, 있으면 끝날 때까지 유지).
+            // ①이 ③보다 먼저라 교체 중 구독자 0 인 순간이 없다.
+            // 동시 load/import 가 서로의 교체를 가로채지 않도록 교체 전체를 직렬화한다.
+            synchronized(networkManagerSwapLock) {
+                val previous = field
+                if (previous === value) return
+                field = value
+                value?.adoptChannels(defaultBearer = meshBearer, from = previous)
+                val previousObservers = listOfNotNull(networkManagerEventObserver, observeMeshMessages)
                 networkManagerEventObserver = null
-                observeMeshMessages?.cancel()
                 observeMeshMessages = null
+                if (value != null) {
+                    observeNetworkManagerEvents()
+                    observeMeshMessages()
+                }
+                if (previous != null) {
+                    previous.retire(observerJobs = previousObservers)
+                } else {
+                    previousObservers.forEach { it.cancel() }
+                }
             }
         }
+
+    private val networkManagerSwapLock = Any()
 
     var logger: Logger? = null
 
@@ -1370,7 +1391,10 @@ class MeshNetworkManager(
                                     // this@MeshNetworkManager.localElements = localElements
                                 }
                         }
-                    }?.launchIn(scope = scope)
+                    }?.let { flow ->
+                        // simdo-fork (2026-09-28) — 구독 등록 후 반환(교체 직후 첫 메시지 유실 방지).
+                        scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { flow.collect() }
+                    }
             }.onFailure {
                 logger?.w(category = LogCategory.FOUNDATION_MODEL) {
                     "Error while observing network manager events: ${it.message}"
@@ -1399,7 +1423,10 @@ class MeshNetworkManager(
                                 ttl = it.ttl,
                             )
                         )
-                    }?.launchIn(scope = scope)
+                    }?.let { flow ->
+                        // simdo-fork (2026-09-28) — 구독 등록 후 반환(교체 직후 첫 메시지 유실 방지).
+                        scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { flow.collect() }
+                    }
             }.onFailure {
                 logger?.w(category = LogCategory.FOUNDATION_MODEL) {
                     "Error while observing incoming mesh messages: ${it.message}"

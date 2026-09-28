@@ -77,19 +77,28 @@ internal class NetworkPdu internal constructor(
 
     val sequenceZero: UShort?
         get() = if (isSegmented || isSegmentAcknowledgementMessage) {
-            ((transportPdu[1] and 0x7F).toUShort() shl 6) or (transportPdu[2] shr 2).toUShort()
+            wireSequenceZero(transportPdu)
         } else null
 
     private val messageSequence: UInt
         get() = if (isSegmented) {
-            val sequenceZero = (transportPdu[1].toUShort() and 0x7Fu shl 6) or
-                    (transportPdu[2].toUShort() shr 2)
+            val sequenceZero = wireSequenceZero(transportPdu)
             if ((sequence and 0x1FFFFu) < sequenceZero) {
                 (sequence and 0xFFE000u) + sequenceZero.toUInt() - (0x1FFF + 1).toUInt()
             } else {
                 (sequence and 0xFFE000u) + sequenceZero.toUInt()
             }
         } else sequence
+
+    /**
+     * octet 1..2 의 SeqZero 13비트 (Mesh Profile 1.0.1 §3.5.2.2 / §3.5.2.3.1).
+     *
+     * simdo-fork (2026-09-28) — 종전 식은 octet 2 를 부호 있는 Byte 로 오른쪽 이동해(0xF4 → 0xFFFD) 하위 6비트가
+     * 32 이상인 SeqZero 를 0xFFxx 로 읽었다. 재조립 진행 판정(LowerTransportLayer RPL 검사)과 messageSequence 가
+     * 그 값을 쓴다. 옥텟을 부호 없이 읽는다.
+     */
+    private fun wireSequenceZero(transportPdu: ByteArray): UShort =
+        (((transportPdu[1].toInt() and 0x7F) shl 6) or ((transportPdu[2].toInt() and 0xFF) ushr 2)).toUShort()
 
     @OptIn(ExperimentalStdlibApi::class)
     override fun toString(): String {

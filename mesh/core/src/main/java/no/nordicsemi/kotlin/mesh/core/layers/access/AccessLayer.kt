@@ -2,6 +2,9 @@
 
 package no.nordicsemi.kotlin.mesh.core.layers.access
 
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -14,6 +17,7 @@ import no.nordicsemi.kotlin.mesh.core.layers.KeySet
 import no.nordicsemi.kotlin.mesh.core.layers.MessageHandle
 import no.nordicsemi.kotlin.mesh.core.layers.NetworkManager
 import no.nordicsemi.kotlin.mesh.core.layers.NetworkManagerEvent
+import no.nordicsemi.kotlin.mesh.core.layers.ReceivedMessage
 import no.nordicsemi.kotlin.mesh.core.layers.foundation.SceneClientHandler
 import no.nordicsemi.kotlin.mesh.core.layers.uppertransport.UpperTransportPdu
 import no.nordicsemi.kotlin.mesh.core.messages.AcknowledgedConfigMessage
@@ -285,18 +289,37 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
             createReliableContext(pdu = pdu, element = element, initialTtl = ttl, keySet = keySet)
         } else null
 
-        networkManager.upperTransportLayer.send(accessPdu = pdu, ttl = ttl, keySet = keySet)
+        // If ack is null, the message is not acknowledged, hence return null
+        return sendThenAwait(
+            awaitResponse = ack?.let {
+                {
+                    networkManager.awaitMeshMessageResponse(
+                        destination = destination,
+                        responseOpcode = it.request.responseOpCode,
+                        timeout = it.timeout
+                    )
+                }
+            },
+            send = { networkManager.upperTransportLayer.send(accessPdu = pdu, ttl = ttl, keySet = keySet) },
+        )
+    }
 
-        return when {
-            // If ack is null, the message is not acknowledged, hence return null
-            ack == null -> null
-
-            else -> networkManager.awaitMeshMessageResponse(
-                destination = destination,
-                responseOpcode = ack.request.responseOpCode,
-                timeout = ack.timeout
-            )?.message as? MeshMessage
-        }
+    /**
+     * simdo-fork (2026-09-28) — 응답 구독을 **송신 전에** 등록하고 송신한 뒤 기다린다.
+     *
+     * 종전에는 `upperTransportLayer.send` 가 끝난 뒤에 [NetworkManager.awaitMeshMessageResponse] 를 불렀다. 분할 메시지는
+     * `send` 가 마지막 분할 뒤에도 분할 간격(기본 60 ms)만큼 기다렸다 반환하므로, 노드가 그 안에 응답하면(1홉·짧은 연결
+     * 간격) 응답은 수신·복호되고 reliable context 까지 소비된 뒤 구독 없는 SharedFlow 로 사라졌다 → 재전송도 없이 access
+     * 타임아웃 전체를 기다렸다 (실기기 2026-09-28 14:46:22 ConfigAppKeyAdd, Status 22.320 수신·송신 반환 ~22.325).
+     * `UNDISPATCHED` 로 시작하면 [NetworkManager.awaitMeshMessageResponse] 가 첫 suspend 전에 SharedFlow 에 구독한다.
+     */
+    private suspend fun sendThenAwait(
+        awaitResponse: (suspend () -> ReceivedMessage?)?,
+        send: suspend () -> Unit,
+    ): MeshMessage? = coroutineScope {
+        val response = awaitResponse?.let { async(start = CoroutineStart.UNDISPATCHED) { it() } }
+        send()
+        response?.await()?.message as? MeshMessage
     }
 
     /**
@@ -348,13 +371,16 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
             keySet = keySet
         )
 
-        networkManager.upperTransportLayer.send(accessPdu = pdu, ttl = initialTtl, keySet = keySet)
-
-        return networkManager.awaitMeshMessageResponse(
-            destination = destination,
-            responseOpcode = ack.request.responseOpCode,
-            timeout = ack.timeout
-        )?.message as? MeshMessage
+        return sendThenAwait(
+            awaitResponse = {
+                networkManager.awaitMeshMessageResponse(
+                    destination = destination,
+                    responseOpcode = ack.request.responseOpCode,
+                    timeout = ack.timeout
+                )
+            },
+            send = { networkManager.upperTransportLayer.send(accessPdu = pdu, ttl = initialTtl, keySet = keySet) },
+        )
     }
 
     /**

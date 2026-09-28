@@ -108,7 +108,14 @@ class FakeProvisioneeBearer(
 
     override suspend fun close() {
         _state.value = BearerEvent.Closed(BearerError.Closed())
+        invited = false // Zephyr: 링크(BLE) 가 닫히면 prov_link_closed → FSM 초기화
     }
+
+    /**
+     * 이 링크에서 이미 Invite 를 받았는가. Zephyr provisionee 는 링크당 Invite 한 번만 받는다 — 링크가 열린 채 두 번째
+     * Invite 가 오면 `Unexpected msg` → Provisioning Failed(Unexpected PDU 0x03). 링크가 닫혀야(close) 초기화된다.
+     */
+    private var invited = false
 
     override suspend fun send(pdu: ByteArray, type: PduType) {
         require(type == PduType.PROVISIONING_PDU) { "Only provisioning PDUs are supported" }
@@ -124,6 +131,11 @@ class FakeProvisioneeBearer(
     }
 
     private suspend fun onInvite(pdu: ByteArray) {
+        if (invited) {
+            reply(ProvisioningResponse.Failed(error = RemoteProvisioningError.UNEXPECTED_PDU))
+            return
+        }
+        invited = true
         confirmationInputs += pdu.sliceArray(indices = 1 until pdu.size)
         val response = ProvisioningResponse.Capabilities(capabilities = capabilities)
         confirmationInputs += response.pdu.sliceArray(indices = 1 until response.pdu.size)

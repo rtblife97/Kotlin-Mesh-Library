@@ -112,8 +112,12 @@ internal class SegmentAcknowledgementMessage(
             require(opCode == 0x00.toUByte()) { throw InvalidPdu() }
 
             val isOnBehalfOfLowePowerNode = pdu.transportPdu[1] hasBitSet 7
-            val sequenceZero: UShort = ((pdu.transportPdu[1].toUShort() and 0x7Fu) shl 6) or
-                    (pdu.transportPdu[2].toUShort() shr 2)
+            // simdo-fork (2026-09-28) — SeqZero 하위 6비트는 octet 2 의 상위 6비트다. 종전 `Byte.toUShort()` 는
+            // 부호를 확장해(0xF4 → 0xFFF4) 하위 6비트가 32 이상인 SeqZero(전체의 절반)를 0x3FFx 로 읽었다 →
+            // 그 ACK 는 어느 송신에도 맞지 않아 버려지고 분할 송신은 재전송 횟수를 다 쓸 때까지 계속됐다
+            // (실기기 14:46:21 seqZero 125 → 16381). 옥텟을 부호 없이 읽는다.
+            val sequenceZero: UShort = (((pdu.transportPdu[1].toInt() and 0x7F) shl 6) or
+                    ((pdu.transportPdu[2].toInt() and 0xFF) ushr 2)).toUShort()
             val ackedSegments = pdu.transportPdu.getUInt(offset = 3)
             val upperTransportPdu = pdu.transportPdu.copyOfRange(3, pdu.transportPdu.size)
             return SegmentAcknowledgementMessage(

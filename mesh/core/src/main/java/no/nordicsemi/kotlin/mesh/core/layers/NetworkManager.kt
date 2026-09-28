@@ -3,18 +3,17 @@
 package no.nordicsemi.kotlin.mesh.core.layers
 
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
-import kotlinx.coroutines.flow.timeout
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -49,6 +48,7 @@ import no.nordicsemi.kotlin.mesh.logger.LogCategory
 import no.nordicsemi.kotlin.mesh.logger.Logger
 import kotlin.concurrent.timer
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.DurationUnit
 
 /**
@@ -84,12 +84,161 @@ internal class NetworkManager internal constructor(
     // 본 fix 로 같은 NetworkManager 안의 중복 collector 회피.
     private var bearerCollectorJob: kotlinx.coroutines.Job? = null
 
+    // simdo-fork (2026-09-28) — 수신 채널 lifecycle 잠금.
+    //
+    // 1) setter 경합: 앱(KotlinMeshActivator)은 activate() 의 load 직후 재할당과 NetworkUpdated 핸들러의
+    //    재할당을 **서로 다른 스레드에서 같은 ms 에** 부른다(실기기 2026-09-28 11:29:33.400). 종전 setter 는
+    //    `cancel(이전) → 새 collector 대입` 이 원자적이지 않아, 두 호출이 같은 이전 Job 을 cancel 한 뒤 각자
+    //    collector 를 대입하면 먼저 대입된 쪽이 참조를 잃고 영구히 살아남았다(같은 스택이 PDU 를 2번 처리 —
+    //    로그상 Secure Network Beacon 3회 수신 + "PDU already handled").
+    // 2) 같은 bearer 재할당 churn: 앱은 NetworkUpdated(Status 마다 save → 노드당 ~70회)마다 같은 bearer 를
+    //    다시 넣는다. 종전 setter 는 매번 collector 를 끊고 다시 띄웠고, `bearer.pdus` 는 replay 없는
+    //    SharedFlow 라 그 사이에 도착한 PDU 는 구독자 0 으로 버려졌다. 같은 bearer 이고 collector 가 살아
+    //    있으면 no-op 으로 둔다. (새 NetworkManager 는 field 가 null 이라 이 분기에 걸리지 않는다 — E11/N-3
+    //    hotfix 가 요구한 "새 인스턴스에는 반드시 bearer 를 물린다" 는 그대로 유지된다.)
+    private val channelLock = Any()
+
     var bearer: MeshBearer? = null
-        internal set(value) {
+        internal set(value) = synchronized(channelLock) {
+            if (value != null && value === field && bearerCollectorJob?.isActive == true && !rxClosed) {
+                return@synchronized
+            }
             field = value
             bearerCollectorJob?.cancel()
-            bearerCollectorJob = awaitBearerPdus(bearer = value)
+            bearerCollectorJob = if (rxClosed) null else awaitBearerPdus(bearer = value)
         }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // simdo-fork (2026-09-28) — NetworkManager 교체 시 옛 인스턴스 은퇴.
+    //
+    // MeshNetworkManager.load()/import()/create() 는 매번 새 NetworkManager 를 만든다. 종전에는 옛 인스턴스의
+    // bearer collector 를 끊지 않아 두 스택(각자 NetworkLayer 캐시·SAR·ProxyFilter 트리거)이 같은 PDU 를
+    // 처리했다 — 수신 이중 처리, SetFilterType/AddAddressesToFilter·SAR ACK 이중 송신, SEQ 낭비,
+    // "Proxy Filter limit reached" 경고(실기기 2026-09-28).
+    //
+    // 옛 인스턴스를 즉시 끊지 못하는 경우가 하나 있다: 옛 인스턴스로 이미 나간 요청(acknowledged send /
+    // Proxy Configuration)은 **그 인스턴스의** incoming flow 에서 응답을 기다린다. 끊으면 그 응답이 새 스택으로만
+    // 가서 요청이 타임아웃난다(종전에는 옛 스택이 계속 살아 있어서 우연히 가려졌다 — Realtime CDB import 등
+    // 설정 도중 import 는 실제로 일어난다). 그래서 진행 중 송신이 0 이 될 때까지만 수신을 유지하고(drain),
+    // 0 이 되는 순간 수신을 닫는다. drain 은 [retireDrainTimeout] 상한이 있다.
+    private val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+
+    @Volatile
+    private var retired = false
+
+    @Volatile
+    private var rxClosed = false
+
+    private var retiredObserverJobs: List<kotlinx.coroutines.Job> = emptyList()
+
+    /** 진행 중인 송신(응답 대기 포함) 수. 테스트·진단용. */
+    internal val inFlightCount: Int
+        get() = inFlight.get()
+
+    /** 은퇴 후 수신까지 닫혔는가. 테스트·진단용. */
+    internal val isRxClosed: Boolean
+        get() = rxClosed
+
+    /**
+     * 송신 1건을 in-flight 로 표시한다. 은퇴해 수신이 이미 닫힌 인스턴스로 송신이 들어오면(교체 직전에
+     * 인스턴스를 잡아 둔 호출자) 응답을 받을 수 있게 수신을 잠시 다시 연다 — 그 송신이 끝나면 다시 닫는다.
+     */
+    internal fun enterInFlight() {
+        inFlight.incrementAndGet()
+        if (retired) synchronized(channelLock) {
+            if (rxClosed) {
+                logger?.w(LogCategory.BEARER) {
+                    "Retired network stack used for sending; reopening RX until the send completes"
+                }
+                rxClosed = false
+                bearerCollectorJob?.cancel()
+                bearerCollectorJob = awaitBearerPdus(bearer = bearer)
+                _bearers.forEach { (destination, registered) ->
+                    bearerCollectorJobs.remove(destination)?.cancel()
+                    awaitBearerPdus(bearer = registered)?.let { bearerCollectorJobs[destination] = it }
+                }
+            }
+        }
+    }
+
+    internal fun exitInFlight() {
+        if (inFlight.decrementAndGet() <= 0 && retired) closeRx()
+    }
+
+    private inline fun <T> trackInFlight(block: () -> T): T {
+        enterInFlight()
+        try {
+            return block()
+        } finally {
+            exitInFlight()
+        }
+    }
+
+    /**
+     * 새 인스턴스가 옛 인스턴스의 수신 채널을 넘겨받는다. [defaultBearer] 를 물리고(구독이 끝난 뒤 반환 —
+     * [awaitBearerPdus] 는 UNDISPATCHED), 옛 인스턴스의 per-destination 등록도 그대로 옮긴다. 이것이 끝난
+     * 뒤에 옛 인스턴스를 은퇴시키므로 교체 사이에 구독자 0 인 순간이 없다.
+     */
+    internal fun adoptChannels(defaultBearer: MeshBearer?, from: NetworkManager?) {
+        if (defaultBearer != null) bearer = defaultBearer
+        from?.bearers?.forEach { (destination, registered) ->
+            registerBearer(destination = destination, meshBearer = registered)
+        }
+    }
+
+    /**
+     * 이 인스턴스를 은퇴시킨다. 진행 중 송신이 없으면 즉시 수신을 닫고, 있으면 끝날 때까지(최대
+     * [retireDrainTimeout]) 수신을 유지한다. [observerJobs] 는 이 인스턴스의 flow 를 구독하던
+     * MeshNetworkManager 쪽 관찰자로, 수신을 닫을 때 같이 끊는다(drain 중 들어온 응답의 save/이벤트는 유지).
+     */
+    internal fun retire(observerJobs: List<kotlinx.coroutines.Job>) {
+        synchronized(channelLock) {
+            retired = true
+            retiredObserverJobs = observerJobs
+        }
+        if (inFlight.get() <= 0) {
+            closeRx()
+            return
+        }
+        logger?.i(LogCategory.BEARER) {
+            "Replaced network stack keeps RX until ${inFlight.get()} in-flight message(s) complete"
+        }
+        scope.launch {
+            kotlinx.coroutines.withTimeoutOrNull(retireDrainTimeout) {
+                while (inFlight.get() > 0) kotlinx.coroutines.delay(50)
+            }
+            if (!rxClosed) {
+                if (inFlight.get() > 0) {
+                    logger?.w(LogCategory.BEARER) {
+                        "Replaced network stack still has ${inFlight.get()} in-flight message(s) after " +
+                            "$retireDrainTimeout; closing RX"
+                    }
+                }
+                closeRx(force = true)
+            }
+        }
+    }
+
+    private val retireDrainTimeout: Duration
+        get() = manager.networkParameters.acknowledgementMessageTimeout + 5.seconds
+
+    private fun closeRx(force: Boolean = false) {
+        val observers: List<kotlinx.coroutines.Job>
+        synchronized(channelLock) {
+            if (!retired || rxClosed) return
+            if (!force && inFlight.get() > 0) return
+            rxClosed = true
+            bearerCollectorJob?.cancel()
+            bearerCollectorJob = null
+            bearerCollectorJobs.values.forEach { it.cancel() }
+            bearerCollectorJobs.clear()
+            observers = retiredObserverJobs
+            retiredObserverJobs = emptyList()
+        }
+        observers.forEach { it.cancel() }
+        // 은퇴한 스택의 주기 publication 타이머·acknowledgement 컨텍스트 정리(upstream 의 teardown).
+        runCatching { accessLayer.close() }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────────
     // simdo-fork (2026-06-07, P6 M=2) — per-destination bearer registry.
@@ -111,7 +260,9 @@ internal class NetworkManager internal constructor(
     //   source/responseOpCode/destination 3-키 매칭)·SAR RX(incompleteSegments per-(src,seqZero))·
     //   TX seq(seqMutex atomic)·UpperTransport queue(per-dest)·CDB(cdbMutex) 전부 src/dest-keyed →
     //   N 동시 multi-destination config 트랜잭션이 cross-talk 0. registry 는 채널 라우팅만 추가한다.
-    private val bearersLock = Any()
+    // simdo-fork (2026-09-28) — registry 와 default bearer 수신 채널이 같은 잠금을 쓴다(은퇴 시 일괄 정리).
+    private val bearersLock: Any
+        get() = channelLock
 
     @Volatile
     private var _bearers: Map<Address, MeshBearer> = emptyMap()
@@ -147,6 +298,11 @@ internal class NetworkManager internal constructor(
         if (_bearers[destination] === meshBearer) return@synchronized
         // 같은 dst 에 이전 bearer 가 있었다면 그 collector 를 먼저 정리(누수 방지).
         bearerCollectorJobs.remove(destination)?.cancel()
+        if (rxClosed) {
+            // 은퇴해 수신이 닫힌 스택 — TX 라우팅만 기록하고 collector 는 띄우지 않는다.
+            _bearers = _bearers + (destination to meshBearer)
+            return@synchronized
+        }
         // simdo-fork (2026-06-08, A-H1) — RX collector 를 **먼저** 띄우고 그게 살아 있을 때만 _bearers 에
         // 커밋한다. 종전엔 _bearers 커밋(TX 라우팅 활성)이 collector 생성 앞이라, awaitBearerPdus 가 null
         // (bearer.pdus 미가용)이면 반쪽 등록(TX 는 이 bearer 로 가나 RX 없음)이 됐다. 둘 다 bearersLock
@@ -207,6 +363,10 @@ internal class NetworkManager internal constructor(
     internal val incomingMeshMessages
         get() = _incomingMeshMessages.asSharedFlow()
 
+    /** 테스트 전용 — access 복호화 없이 수신 메시지 1건을 이 스택의 incoming flow 로 흘린다. */
+    internal suspend fun emitIncomingMeshMessageForTest(message: ReceivedMessage) =
+        _incomingMeshMessages.emit(value = message)
+
     private val _networkManagerEventFlow = MutableSharedFlow<NetworkManagerEvent>()
     override val networkManagerEventFlow
         get() = _networkManagerEventFlow.asSharedFlow()
@@ -219,13 +379,18 @@ internal class NetworkManager internal constructor(
      * (P6) — RX is src/dest-keyed downstream, so multiple bearers simply fan-in.
      */
     private fun awaitBearerPdus(bearer: MeshBearer?): kotlinx.coroutines.Job? {
-        return bearer?.pdus
-            ?.onEach {
+        val pdus = bearer?.pdus ?: return null
+        // simdo-fork (2026-09-28) — UNDISPATCHED: `collect` 가 SharedFlow 구독을 등록한 뒤에야 이 함수가
+        // 반환된다. 교체·재구독 직후 곧바로 옛 collector 를 끊어도 구독자 0 인 순간이 생기지 않는다
+        // (`pdus` 는 replay 없는 SharedFlow — 구독자 0 일 때 emit 된 PDU 는 사라진다).
+        return scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            pdus.collect {
                 runCatching { handle(incomingPdu = it.data, type = it.type) }
                     .onFailure { throwable ->
                         logger?.e(LogCategory.BEARER) { "Bearer error: $throwable" }
                     }
-            }?.launchIn(scope = scope)
+            }
+        }
     }
 
     /**
@@ -278,39 +443,42 @@ internal class NetworkManager internal constructor(
     /**
      * Awaits for a response for a previously sent message.
      *
+     * simdo-fork (2026-09-28) — 구독이 **이 함수가 처음 멈추기 전에** 등록되도록 `withTimeout { first {} }` 로 쓴다
+     * (종전 `.timeout()` 연산자는 내부 produce 코루틴이 dispatch 된 뒤에야 구독했다). 호출자는 송신 **전에**
+     * `async(start = UNDISPATCHED)` 로 이 함수를 시작해야 한다 — [incomingMeshMessages] 는 replay 없는 SharedFlow 라
+     * 구독 전에 도착한 응답은 사라진다. 실기기 2026-09-28 14:46:22: 2분할 ConfigAppKeyAdd 의 Status 가 송신 함수
+     * (마지막 분할 뒤 분할 간격만큼 기다림) 반환보다 몇 ms 먼저 도착해 수신·복호까지 됐는데도 15 s 타임아웃.
+     *
      * @param destination Destination address of the message.
      * @param timeout     Timeout duration.
      */
-    @OptIn(FlowPreview::class)
     suspend fun awaitMeshMessageResponse(
         destination: MeshAddress,
         responseOpcode: UInt,
         timeout: Duration,
-    ): ReceivedMessage? = incomingMeshMessages
-        .timeout(timeout = timeout)
-        .catch {
-            // If it's a timeout exception that's thrown we should log it in the bearer
-            if (it is TimeoutCancellationException) {
-                logger?.w(LogCategory.BEARER) {
-                    "Timed out waiting for a response with response opCode 0x${
-                        responseOpcode.toHexString(
-                            format = HexFormat.UpperCase
-                        )
-                    } from ${
-                        destination.address.toHexString(
-                            format = HexFormat {
-                                number.prefix = "0x"
-                                upperCase = true
-                            }
-                        )
-                    }: $it"
-                }
+    ): ReceivedMessage? = try {
+        withTimeout(timeout) {
+            incomingMeshMessages.first {
+                destination == it.source && responseOpcode == (it.message as? HasOpCode)?.opCode
             }
-            throw it
         }
-        .firstOrNull {
-            destination == it.source && responseOpcode == (it.message as? HasOpCode)?.opCode
+    } catch (e: TimeoutCancellationException) {
+        logger?.w(LogCategory.BEARER) {
+            "Timed out waiting for a response with response opCode 0x${
+                responseOpcode.toHexString(
+                    format = HexFormat.UpperCase
+                )
+            } from ${
+                destination.address.toHexString(
+                    format = HexFormat {
+                        number.prefix = "0x"
+                        upperCase = true
+                    }
+                )
+            }: $e"
         }
+        throw e
+    }
 
     /**
      * Awaits for a response to a sent message.
@@ -428,14 +596,16 @@ internal class NetworkManager internal constructor(
         // ensureNotBusy 가 add 성공(=false 반환) 한 뒤에만 이 블록에 진입하므로 finally remove 가 항상 짝맞음
         // (ensureNotBusy 가 Busy throw 하면 add 안 했고 이 블록 미진입 → 남의 엔트리 오삭제 없음).
         try {
-            accessLayer.send(
-                message = message,
-                element = element,
-                destination = destination,
-                ttl = initialTtl,
-                applicationKey = applicationKey,
-                retransmit = false
-            )
+            trackInFlight {
+                accessLayer.send(
+                    message = message,
+                    element = element,
+                    destination = destination,
+                    ttl = initialTtl,
+                    applicationKey = applicationKey,
+                    retransmit = false
+                )
+            }
         } finally {
             // NonCancellable — outer cancel(예: caller withTimeout) 로 코루틴이 cancel 된 상태에선
             // finally 내 suspend(mutex.withLock)도 즉시 CancellationException 을 던져 remove 가 건너뛰어진다.
@@ -475,14 +645,16 @@ internal class NetworkManager internal constructor(
         // simdo-fork (2026-06-08, C-F2) — busy-set 누수 봉인. ensureNotBusy add 성공 후에만 try 진입 →
         // accessLayer.send 가 ack timeout 으로 throw 해도 finally 가 outgoingMessages 에서 dst 제거.
         return try {
-            accessLayer.send(
-                message = message,
-                element = element,
-                destination = destination,
-                ttl = initialTtl,
-                applicationKey = applicationKey,
-                retransmit = false
-            )
+            trackInFlight {
+                accessLayer.send(
+                    message = message,
+                    element = element,
+                    destination = destination,
+                    ttl = initialTtl,
+                    applicationKey = applicationKey,
+                    retransmit = false
+                )
+            }
         } finally {
             // NonCancellable — cancel 경로에서도 busy-set 정리 보장(위 send 참조).
             withContext(NonCancellable) { mutex.withLock { outgoingMessages.remove(destination) } }
@@ -518,13 +690,15 @@ internal class NetworkManager internal constructor(
         // simdo-fork (2026-06-08, C-F2) — busy-set 누수 봉인. ensureNotBusy add 성공 후에만 try 진입 →
         // accessLayer.send throw/cancel 시에도 finally 가 outgoingMessages 에서 meshAddress 제거.
         try {
-            accessLayer.send(
-                message = configMessage,
-                localElement = element,
-                destination = destination,
-                initialTtl = initialTtl,
-                networkKey = networkKey
-            )
+            trackInFlight {
+                accessLayer.send(
+                    message = configMessage,
+                    localElement = element,
+                    destination = destination,
+                    initialTtl = initialTtl,
+                    networkKey = networkKey
+                )
+            }
         } finally {
             // Added to clear the outgoing message list
             // NonCancellable — cancel 경로에서도 busy-set 정리 보장(위 send 참조).
@@ -565,13 +739,15 @@ internal class NetworkManager internal constructor(
         // P6: outgoingMessages 는 dst-keyed(registry/default 무관) — config 실패가 같은 dst 의 측위/group
         // 제어 채널까지 Busy 오염시키던 누수를 봉인한다.
         return try {
-            accessLayer.send(
-                message = configMessage,
-                localElement = element,
-                destination = destination,
-                initialTtl = initialTtl,
-                networkKey = networkKey
-            )
+            trackInFlight {
+                accessLayer.send(
+                    message = configMessage,
+                    localElement = element,
+                    destination = destination,
+                    initialTtl = initialTtl,
+                    networkKey = networkKey
+                )
+            }
         } finally {
             // Added to clear the outgoing message list
             // NonCancellable — cancel 경로에서도 busy-set 정리 보장(위 send 참조).
@@ -585,7 +761,7 @@ internal class NetworkManager internal constructor(
      * @param message Proxy Configuration message to be sent.
      */
     suspend fun send(message: ProxyConfigurationMessage): ProxyConfigurationMessage? =
-        networkLayer.send(message = message)
+        trackInFlight { networkLayer.send(message = message) }
 
     /**
      * Replies to the received message, which was sent with the given key set, with the given
