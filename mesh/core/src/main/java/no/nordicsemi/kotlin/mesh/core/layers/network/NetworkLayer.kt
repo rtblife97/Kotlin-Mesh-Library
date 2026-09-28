@@ -55,10 +55,18 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
     /**
      * This method handles the received PDU of given type and passes it to Upper Transport Layer.
      *
+     * simdo-fork (2026-09-29, 동시 GATT 설정 1단계) — [viaDefaultBearer]: 이 PDU 가 기본 베어러([NetworkManager.bearer])로
+     * 왔는가. 목적지별로 등록한 베어러([NetworkManager.registerBearer])로 온 PDU 는 false. 프록시 필터 상태
+     * ([proxyNetworkKey], [ProxyFilter]) 는 기본 링크 하나의 것이라, 등록 링크로 온 Secure Network Beacon 이 기본 링크의 필터
+     * 초기화를 부르거나 등록 링크로 온 Proxy Configuration PDU 가 기본 링크의 필터 응답으로 소비되면 안 된다. IV Index·키
+     * 갱신 판정과 메시 메시지 처리는 어느 링크로 왔든 같다(망 상태는 하나). 등록이 없으면 모든 PDU 가 기본 베어러로 오므로
+     * 종전과 동작이 같다.
+     *
      * @param incomingPdu  Data received.
      * @param type         PDU type.
+     * @param viaDefaultBearer 기본 베어러로 왔는가 (기본 true — 루프백·종전 호출자).
      */
-    suspend fun handle(incomingPdu: ByteArray, type: PduType): ReceivedMessage? {
+    suspend fun handle(incomingPdu: ByteArray, type: PduType, viaDefaultBearer: Boolean = true): ReceivedMessage? {
         // Discard provisioning pdus as they are handled by the provisioning manager
         if (type == PduType.PROVISIONING_PDU) return null
 
@@ -118,7 +126,7 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                     }
                     // TODO possible late init property initialization error
                     try {
-                        handle(networkBeacon = it)
+                        handle(networkBeacon = it, viaDefaultBearer = viaDefaultBearer)
                     } catch (e: Exception) {
                         logger?.e(LogCategory.NETWORK) { "Failed to handle beacon $e" }
                     }
@@ -134,6 +142,12 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             }
 
             PduType.PROXY_CONFIGURATION -> {
+                // simdo-fork (2026-09-29) — 필터 설정은 기본 링크에만 보낸다. 등록 링크로 온 Proxy Configuration PDU 는 기본 링크의
+                // 필터 응답 대기([NetworkManager.awaitProxyMessageResponse] — 송신자 구분 없이 첫 PDU) 로 소비되면 안 된다.
+                if (!viaDefaultBearer) {
+                    logger?.w(LogCategory.PROXY) { "Proxy Configuration PDU on a per-destination bearer ignored" }
+                    return null
+                }
                 return NetworkPduDecoder.decode(
                     pdu = incomingPdu,
                     pduType = type,
@@ -200,13 +214,17 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
         } else {
             // Messages sent with TTL = 1 will only be sent locally.
             require(ttl != 1.toUByte()) { return }
+            // simdo-fork (2026-09-29) — 등록 링크로 나가는가를 송신 전에 한 번 정한다. 등록 링크가 닫혀 있어도 기본 링크의 필터 키를
+            // 지우지 않는다 (종전: 어느 베어러의 Closed 든 지워 다음 기본 링크 Beacon 에 필터 재설정이 나갔다 — 동시 설정 D3).
+            val destination = networkPdu.destination.address
+            val viaRegistered = networkManager.hasRegisteredBearer(destination = destination)
             try {
                 // simdo-fork (2026-06-07, P6) — dst 로 라우팅. 미등록(group/proxy/평상시)이면 default bearer.
-                networkManager.bearerFor(destination = networkPdu.destination.address)
+                networkManager.bearerFor(destination = destination)
                     ?.send(pdu = networkPdu.pdu, type = type)
                     ?: throw BearerError.Closed()
             } catch (e: Exception) {
-                if (e is BearerError.Closed) {
+                if (e is BearerError.Closed && !viaRegistered) {
                     proxyNetworkKey = null
                 }
                 throw e
@@ -300,7 +318,7 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
      * information specified in them.
      */
     @OptIn(ExperimentalTime::class, ExperimentalUuidApi::class)
-    private suspend fun handle(networkBeacon: NetworkBeaconPdu) {
+    private suspend fun handle(networkBeacon: NetworkBeaconPdu, viaDefaultBearer: Boolean = true) {
         // The network key the beacon was authenticated with.
         val networkKey = networkBeacon.networkKey
 
@@ -310,7 +328,7 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             }
 
             if (proxyNetworkKey == null) {
-                updateProxyFilter(networkKey)
+                if (viaDefaultBearer) updateProxyFilter(networkKey)
                 return
             }
         }
@@ -390,7 +408,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
 
         // The beacon was sent by a Node with a previous IV Index, that was not yet transition to
         // the one the local node has. Such an IV Index is still valid, at least for sometime.
-        updateProxyFilter(networkKey)
+        // simdo-fork (2026-09-29) — 필터 상태는 기본 링크의 것. 등록 링크의 Beacon 은 IV 판정에만 쓴다(위), 필터 초기화는 부르지 않는다
+        // (종전: 기본 링크가 없거나 재연결 중이면 등록 링크 Beacon 이 "방금 연결" 로 보여 필터 설정을 기본 베어러로 보냈다 — D3).
+        if (viaDefaultBearer) updateProxyFilter(networkKey)
     }
 
     /**

@@ -105,7 +105,7 @@ internal class NetworkManager internal constructor(
             }
             field = value
             bearerCollectorJob?.cancel()
-            bearerCollectorJob = if (rxClosed) null else awaitBearerPdus(bearer = value)
+            bearerCollectorJob = if (rxClosed) null else awaitBearerPdus(bearer = value, viaDefaultBearer = true)
         }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -152,10 +152,10 @@ internal class NetworkManager internal constructor(
                 }
                 rxClosed = false
                 bearerCollectorJob?.cancel()
-                bearerCollectorJob = awaitBearerPdus(bearer = bearer)
+                bearerCollectorJob = awaitBearerPdus(bearer = bearer, viaDefaultBearer = true)
                 _bearers.forEach { (destination, registered) ->
                     bearerCollectorJobs.remove(destination)?.cancel()
-                    awaitBearerPdus(bearer = registered)?.let { bearerCollectorJobs[destination] = it }
+                    awaitBearerPdus(bearer = registered, viaDefaultBearer = false)?.let { bearerCollectorJobs[destination] = it }
                 }
             }
         }
@@ -308,7 +308,7 @@ internal class NetworkManager internal constructor(
         // (bearer.pdus 미가용)이면 반쪽 등록(TX 는 이 bearer 로 가나 RX 없음)이 됐다. 둘 다 bearersLock
         // 안이라 어차피 원자지만, 순서를 RX-then-TX 로 바로잡아 반쪽 등록 가능성을 구조적으로 제거한다.
         // (현 구현 awaitBearerPdus 는 bearer 가 non-null 이고 pdus 가 항상 있으면 non-null Job 반환.)
-        val job = awaitBearerPdus(bearer = meshBearer) ?: return@synchronized
+        val job = awaitBearerPdus(bearer = meshBearer, viaDefaultBearer = false) ?: return@synchronized
         bearerCollectorJobs[destination] = job
         _bearers = _bearers + (destination to meshBearer)
         logger?.i(LogCategory.BEARER) {
@@ -378,14 +378,14 @@ internal class NetworkManager internal constructor(
      * [handle] path. Used for both the default [bearer] and per-destination registered bearers
      * (P6) — RX is src/dest-keyed downstream, so multiple bearers simply fan-in.
      */
-    private fun awaitBearerPdus(bearer: MeshBearer?): kotlinx.coroutines.Job? {
+    private fun awaitBearerPdus(bearer: MeshBearer?, viaDefaultBearer: Boolean): kotlinx.coroutines.Job? {
         val pdus = bearer?.pdus ?: return null
         // simdo-fork (2026-09-28) — UNDISPATCHED: `collect` 가 SharedFlow 구독을 등록한 뒤에야 이 함수가
         // 반환된다. 교체·재구독 직후 곧바로 옛 collector 를 끊어도 구독자 0 인 순간이 생기지 않는다
         // (`pdus` 는 replay 없는 SharedFlow — 구독자 0 일 때 emit 된 PDU 는 사라진다).
         return scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
             pdus.collect {
-                runCatching { handle(incomingPdu = it.data, type = it.type) }
+                runCatching { handle(incomingPdu = it.data, type = it.type, viaDefaultBearer = viaDefaultBearer) }
                     .onFailure { throwable ->
                         logger?.e(LogCategory.BEARER) { "Bearer error: $throwable" }
                     }
@@ -410,10 +410,12 @@ internal class NetworkManager internal constructor(
      *
      * @param incomingPdu Incoming PDU.
      * @param type        PDU type.
+     * @param viaDefaultBearer simdo-fork (2026-09-29) — 기본 베어러로 왔는가 ([NetworkLayer.handle] 참조). 목적지별 등록 베어러의
+     *   수집기만 false 를 넘긴다. 기본 true = 종전.
      */
-    fun handle(incomingPdu: ByteArray, type: PduType) {
+    fun handle(incomingPdu: ByteArray, type: PduType, viaDefaultBearer: Boolean = true) {
         scope.launch {
-            networkLayer.handle(incomingPdu = incomingPdu, type = type)
+            networkLayer.handle(incomingPdu = incomingPdu, type = type, viaDefaultBearer = viaDefaultBearer)
                 ?.let {
                     if (it.message is ProxyConfigurationMessage) {
                         _incomingProxyMessages.emit(value = it)
