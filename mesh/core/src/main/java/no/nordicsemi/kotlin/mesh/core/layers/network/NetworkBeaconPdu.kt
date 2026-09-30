@@ -94,10 +94,13 @@ internal interface NetworkBeaconPdu : BeaconPdu {
             // Get the number of hours since the state changed last time.
             val numberOfHoursSinceDate = (Clock.System.now() - date).inWholeHours
 
-            // The node shall not execute more than one IV Index Recovery within a
-            // period of 192 hours.
-            if (isIvRecoveryActive && stateDiff.toInt() > 1 && numberOfHoursSinceDate < 192) {
-                return false
+            // simdo-fork (2026-09-30) — IV Index Recovery (Mesh Profile 1.0.1 §3.10.6): 비콘의 IV 가 현재 + 1 을
+            // 넘으면(위 require 로 +42 이내가 보장됨) 이 노드가 IV Update 를 놓친 것이다. 이 경우 상태 전이마다 96 h 를
+            // 요구하는 규칙(위 문서 4번)은 적용되지 않고, 192 h 안에 복구를 한 번 더 하지 않는다는 규칙만 적용된다.
+            // 종전 구현은 복구에도 stateDiff × 96 h 를 요구해(0→2 = 384 h) 운영 중인 망(IV 2)에 새로 들어온 앱이 영영
+            // 합류하지 못했다 (실기기 2026-09-30, 파인테크닉스 본사). 뒤로 가는 IV 와 +43 이상은 종전대로 거부한다.
+            if (ivIndex.index > target.index + 1u) {
+                return !(isIvRecoveryActive && numberOfHoursSinceDate < 192)
             }
 
             numberOfHoursSinceDate >= numberOfHoursRequired

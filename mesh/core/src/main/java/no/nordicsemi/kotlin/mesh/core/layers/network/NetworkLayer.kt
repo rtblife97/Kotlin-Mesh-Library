@@ -349,7 +349,12 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             )
         ) {
             meshNetwork.ivIndex = networkBeacon.ivIndex
-            if (meshNetwork.ivIndex.index > lastIvIndex.index) {
+            if (meshNetwork.ivIndex.index > lastIvIndex.index + 1u) {
+                // simdo-fork (2026-09-30) — IV Index Recovery 로 건너뛴 경우를 따로 남긴다 (앱 판정 로그 대조용).
+                logger?.w(LogCategory.NETWORK) {
+                    "IV Index Recovery: ${lastIvIndex.index} → ${meshNetwork.ivIndex.index} (network ${meshNetwork.uuid})"
+                }
+            } else if (meshNetwork.ivIndex.index > lastIvIndex.index) {
                 logger?.i(LogCategory.NETWORK) { "Applying ${meshNetwork.ivIndex}" }
             }
             meshNetwork.let {
