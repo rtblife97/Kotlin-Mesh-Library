@@ -3,7 +3,9 @@
 package no.nordicsemi.kotlin.mesh.core.layers.network
 
 import kotlinx.coroutines.sync.Mutex
+import no.nordicsemi.kotlin.mesh.bearer.AdvertisingBearer
 import no.nordicsemi.kotlin.mesh.bearer.BearerError
+import no.nordicsemi.kotlin.mesh.bearer.MeshBearer
 import no.nordicsemi.kotlin.mesh.bearer.PduType
 import no.nordicsemi.kotlin.mesh.bearer.gatt.GattBearer
 import no.nordicsemi.kotlin.mesh.core.ProxyFilter
@@ -231,7 +233,7 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             try {
                 // simdo-fork (2026-06-07, P6) — dst 로 라우팅. 미등록이면 default bearer.
                 networkManager.bearerFor(destination = networkPdu.destination.address)
-                    ?.send(pdu = networkPdu.pdu, type = type)
+                    ?.sendWithHint(pdu = networkPdu.pdu, type = type, segmented = pdu is SegmentedMessage)
             } catch (e: Exception) {
                 // Ignore the error because the message was sent locally.
             }
@@ -245,7 +247,7 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             try {
                 // simdo-fork (2026-06-07, P6) — dst 로 라우팅. 미등록(group/proxy/평상시)이면 default bearer.
                 networkManager.bearerFor(destination = destination)
-                    ?.send(pdu = networkPdu.pdu, type = type)
+                    ?.sendWithHint(pdu = networkPdu.pdu, type = type, segmented = pdu is SegmentedMessage)
                     ?: throw BearerError.Closed()
             } catch (e: Exception) {
                 if (e is BearerError.Closed && !viaRegistered) {
@@ -596,4 +598,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                 isLocalUnicastAddress(address as UnicastAddress)
             } ?: false
 
+}
+
+/** simdo-fork (2026-10-05) — 광고 베어러면 분할 힌트를 함께 넘긴다 ([AdvertisingBearer.send]), 그 외 베어러는 종전 send. */
+private suspend fun MeshBearer.sendWithHint(pdu: ByteArray, type: PduType, segmented: Boolean) {
+    if (this is AdvertisingBearer) send(pdu, type, segmented) else send(pdu, type)
 }
