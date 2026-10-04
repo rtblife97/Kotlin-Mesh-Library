@@ -16,6 +16,7 @@ import no.nordicsemi.kotlin.mesh.core.model.Address
 import no.nordicsemi.kotlin.mesh.core.model.MeshAddress
 import no.nordicsemi.kotlin.mesh.core.model.MeshNetwork
 import no.nordicsemi.kotlin.mesh.core.model.NetworkKey
+import no.nordicsemi.kotlin.mesh.core.model.Node
 import no.nordicsemi.kotlin.mesh.core.model.UnicastAddress
 import no.nordicsemi.kotlin.mesh.logger.LogCategory
 import no.nordicsemi.kotlin.mesh.logger.Logger
@@ -72,6 +73,10 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
         get() = networkManager.networkParameters
 
     private val incompleteSegments = mutableMapOf<UInt, MutableList<SegmentedMessage?>>()
+
+    /** simdo-fork (2026-10-05) 테스트·진단용 — 재조립 중인 분할 메시지 수. */
+    internal val incompleteSegmentCount: Int
+        get() = incompleteSegments.size
     private val acknowledgements = mutableMapOf<Address, SegmentAcknowledgementMessage>()
     private val discardTimers = mutableMapOf<UInt, Timer>()
     private val acknowledgementTimers = mutableMapOf<UInt, Timer>()
@@ -191,7 +196,9 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
         networkKey: NetworkKey,
     ) {
         network.localProvisioner?.node?.let { node ->
-            val ttl = initialTtl ?: node.defaultTTL ?: networkManager.networkParameters.defaultTtl
+            // simdo-fork (2026-10-05) — 목적지별 TTL([NetworkManager.ttlOverrideFor]) 이 로컬 노드 Default TTL 보다 앞선다 (동글 광고 베어러).
+            val ttl = initialTtl ?: networkManager.ttlOverrideFor(pdu.destination.address) ?: node.defaultTTL
+                ?: networkManager.networkParameters.defaultTtl
             val message = AccessMessage(pdu = pdu, networkKey = networkKey)
             try {
                 logger?.i(LogCategory.LOWER_TRANSPORT) { "Sending $message" }
@@ -248,8 +255,8 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
         )
 
         // Store the TTL with which the segments are to be sent.
-        segmentTtl[sequenceZero] = initialTtl ?: provisionerNode.defaultTTL
-                ?: networkManager.networkParameters.defaultTtl
+        segmentTtl[sequenceZero] = initialTtl ?: networkManager.ttlOverrideFor(pdu.destination.address)
+                ?: provisionerNode.defaultTTL ?: networkManager.networkParameters.defaultTtl
         // Initialize the retransmission counters.
         if (pdu.destination is UnicastAddress) {
             remainingNumberOfUnicastRetransmissions[sequenceZero] =
@@ -459,7 +466,7 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
                     "Message already acknowledged, sending ACK immediately"
                 }
                 val ttl = if (networkPdu.ttl > 0u) {
-                    provisionerNode.defaultTTL ?: networkManager.networkParameters.defaultTtl
+                    segmentAckTtl(networkPdu, provisionerNode)
                 } else 0u
                 sendAck(ack = lastAck, ttl = ttl)
             } ?: run {
@@ -480,7 +487,7 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
                 it.containsElementWithAddress(address = networkPdu.destination)
             }?.let { provisionerNode ->
                 val ttl = if (networkPdu.ttl > 0u) {
-                    provisionerNode.defaultTTL ?: networkManager.networkParameters.defaultTtl
+                    segmentAckTtl(networkPdu, provisionerNode)
                 } else 0u
                 sendAck(segments = segments, ttl = ttl)
             }
@@ -521,7 +528,7 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
 
                     // ...and send the ACK that all segments were received.
                     val ttl = if (networkPdu.ttl > 0u) {
-                        provisionerNode.defaultTTL ?: networkManager.networkParameters.defaultTtl
+                        segmentAckTtl(networkPdu, provisionerNode)
                     } else 0u
                     sendAck(segments = allSegments, ttl = ttl)
                 }
@@ -572,8 +579,7 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
                         it.purge()
                     }
 
-                    val defaultTtl = provisionerNode.defaultTTL
-                        ?: networkManager.networkParameters.defaultTtl
+                    val defaultTtl = segmentAckTtl(networkPdu, provisionerNode)
                     val ackTimerInterval = networkManager.networkParameters
                         .acknowledgementTimerInterval(segment.lastSegmentNumber)
                     acknowledgementTimers[key] = Timer().also { ackTimer ->
@@ -652,6 +658,14 @@ internal class LowerTransportLayer(private val networkManager: NetworkManager) {
             }
         }
     }
+
+    /**
+     * simdo-fork (2026-10-05) — Segment Acknowledgment 의 TTL (받은 분할의 TTL 이 0 이 아닐 때). 그 분할을 보낸 노드에 목적지별 TTL 이
+     * 있으면 그 값([NetworkManager.ttlOverrideFor] — 동글 광고 베어러로 직접 닿는 조명), 없으면 종전대로 로컬 노드 Default TTL.
+     */
+    private fun segmentAckTtl(networkPdu: NetworkPdu, provisionerNode: Node): UByte =
+        networkManager.ttlOverrideFor(networkPdu.source.address) ?: provisionerNode.defaultTTL
+            ?: networkManager.networkParameters.defaultTtl
 
     /**
      * This method handles the Segment Acknowledgment Message.

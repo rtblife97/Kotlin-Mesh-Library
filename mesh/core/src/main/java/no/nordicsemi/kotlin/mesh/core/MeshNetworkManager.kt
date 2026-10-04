@@ -142,7 +142,11 @@ class MeshNetworkManager(
                 val previous = field
                 if (previous === value) return
                 field = value
-                value?.adoptChannels(defaultBearer = meshBearer, from = previous)
+                value?.adoptChannels(
+                    defaultBearer = meshBearer,
+                    from = previous,
+                    advertisingReceivers = synchronized(advertisingReceivers) { advertisingReceivers.toList() },
+                )
                 val previousObservers = listOfNotNull(networkManagerEventObserver, observeMeshMessages)
                 networkManagerEventObserver = null
                 observeMeshMessages = null
@@ -178,10 +182,42 @@ class MeshNetworkManager(
      *
      * @return true = 등록 수행, false = networkManager 미초기화(활성화 전).
      */
-    fun registerBearer(destination: Address, bearer: MeshBearer): Boolean {
+    fun registerBearer(destination: Address, bearer: MeshBearer): Boolean = registerBearer(destination, bearer, ttl = null)
+
+    /**
+     * simdo-fork (2026-10-05, 커미셔닝 동글 "얇은 무선" 1단계) — [registerBearer] + 이 목적지의 요청 TTL [ttl].
+     *
+     * [ttl] 이 non-null 이면 이 목적지로 TTL 을 정하지 않고(`initialTtl = null`) 보내는 메시지, 그 메시지의 재전송, 이 목적지가 보낸 분할의
+     * Segment Acknowledgment 가 로컬 노드 Default TTL 대신 이 값을 쓴다. 광고 베어러로 직접 닿는 조명에 요청을 작게 flood 하려고 쓴다
+     * (동글 경로 — 1홉 GATT 와 달리 요청도 모든 릴레이가 다시 보낸다). null 이면 [registerBearer] 와 같다. 등록 해제하면 사라진다.
+     *
+     * [bearer] 가 [no.nordicsemi.kotlin.mesh.bearer.AdvertisingBearer] 면 송신 경로만 등록한다 — 수신은 [attachAdvertisingReceiver].
+     */
+    fun registerBearer(destination: Address, bearer: MeshBearer, ttl: UByte?): Boolean {
+        require(ttl == null || ttl in 2u..127u) { "TTL $ttl (2..127)" }
         val nm = networkManager ?: return false
-        nm.registerBearer(destination = destination, meshBearer = bearer)
+        nm.registerBearer(destination = destination, meshBearer = bearer, ttl = ttl)
         return true
+    }
+
+    /** 수신 전용 연결 목록 — 네트워크가 바뀌어(load/import) 새 스택이 생겨도 다시 붙인다. 동일성 기준. */
+    private val advertisingReceivers: MutableSet<MeshBearer> =
+        java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
+
+    /**
+     * simdo-fork (2026-10-05) — 광고 베어러 [receiver] 의 수신을 스택에 **한 번** 붙인다 (송신 경로는 만들지 않는다 — 목적지별
+     * [registerBearer] 가 정한다). 들어온 Network PDU 는 해독 직후 목적지로 거르고(로컬 노드가 받을 주소만), Secure Network Beacon 은 IV
+     * 판정에만 쓴다(기본 링크 프록시 필터를 건드리지 않음). 네트워크를 아직 불러오지 않았으면 불러온 뒤 붙는다. 멱등.
+     */
+    fun attachAdvertisingReceiver(receiver: no.nordicsemi.kotlin.mesh.bearer.AdvertisingBearer) {
+        synchronized(advertisingReceivers) { advertisingReceivers.add(receiver) }
+        networkManager?.attachReceiver(receiver)
+    }
+
+    /** [attachAdvertisingReceiver] 를 되돌린다. 멱등. */
+    fun detachAdvertisingReceiver(receiver: no.nordicsemi.kotlin.mesh.bearer.AdvertisingBearer) {
+        synchronized(advertisingReceivers) { advertisingReceivers.remove(receiver) }
+        networkManager?.detachReceiver(receiver)
     }
 
     /**

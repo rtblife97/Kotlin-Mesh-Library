@@ -783,7 +783,10 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
         require(pdu.destination is UnicastAddress) { return null }*/
 
         // The ttl with which the request will be sent.
-        val ttl = element.parentNode?.defaultTTL ?: networkManager.networkParameters.defaultTtl
+        // simdo-fork (2026-10-05) — 목적지별 TTL([NetworkManager.ttlOverrideFor], 동글 광고 베어러) 이 있으면 첫 재전송 시각·재전송 TTL 도
+        // 그 값으로 (첫 송신과 같은 TTL). 없으면 종전.
+        val ttl = networkManager.ttlOverrideFor(pdu.destination.address)
+            ?: element.parentNode?.defaultTTL ?: networkManager.networkParameters.defaultTtl
 
         val initialDelay = networkManager.networkParameters.acknowledgementMessageInterval(
             ttl = ttl,

@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import no.nordicsemi.kotlin.mesh.bearer.AdvertisingBearer
 import no.nordicsemi.kotlin.mesh.bearer.MeshBearer
 import no.nordicsemi.kotlin.mesh.bearer.PduType
 import no.nordicsemi.kotlin.mesh.bearer.Transmitter
@@ -155,7 +156,13 @@ internal class NetworkManager internal constructor(
                 bearerCollectorJob = awaitBearerPdus(bearer = bearer, viaDefaultBearer = true)
                 _bearers.forEach { (destination, registered) ->
                     bearerCollectorJobs.remove(destination)?.cancel()
+                    // 광고 베어러의 목적지별 등록은 송신 경로만 — 수신은 아래 수신 전용 연결이 맡는다.
+                    if (registered is AdvertisingBearer) return@forEach
                     awaitBearerPdus(bearer = registered, viaDefaultBearer = false)?.let { bearerCollectorJobs[destination] = it }
+                }
+                receivers.keys.toList().forEach { receiver ->
+                    receivers[receiver]?.cancel()
+                    awaitBearerPdus(bearer = receiver, viaDefaultBearer = false)?.let { receivers[receiver] = it }
                 }
             }
         }
@@ -179,11 +186,18 @@ internal class NetworkManager internal constructor(
      * [awaitBearerPdus] 는 UNDISPATCHED), 옛 인스턴스의 per-destination 등록도 그대로 옮긴다. 이것이 끝난
      * 뒤에 옛 인스턴스를 은퇴시키므로 교체 사이에 구독자 0 인 순간이 없다.
      */
-    internal fun adoptChannels(defaultBearer: MeshBearer?, from: NetworkManager?) {
+    internal fun adoptChannels(
+        defaultBearer: MeshBearer?,
+        from: NetworkManager?,
+        advertisingReceivers: Collection<MeshBearer> = emptyList(),
+    ) {
         if (defaultBearer != null) bearer = defaultBearer
         from?.bearers?.forEach { (destination, registered) ->
-            registerBearer(destination = destination, meshBearer = registered)
+            registerBearer(destination = destination, meshBearer = registered, ttl = from.ttlOverrideFor(destination))
         }
+        // simdo-fork (2026-10-05) — 수신 전용 연결(광고 베어러)도 새 인스턴스로 옮긴다. MeshNetworkManager 가 목록을 들고 있다
+        // (네트워크가 아직 없을 때 붙인 것도 load/import 뒤 이 경로로 들어온다).
+        advertisingReceivers.forEach { attachReceiver(it) }
     }
 
     /**
@@ -232,6 +246,8 @@ internal class NetworkManager internal constructor(
             bearerCollectorJob = null
             bearerCollectorJobs.values.forEach { it.cancel() }
             bearerCollectorJobs.clear()
+            // 수신 전용 연결은 목록을 남기고 수집만 끊는다 (enterInFlight 가 다시 열 수 있게).
+            receivers.keys.toList().forEach { receivers[it]?.cancel(); receivers[it] = null }
             observers = retiredObserverJobs
             retiredObserverJobs = emptyList()
         }
@@ -294,12 +310,17 @@ internal class NetworkManager internal constructor(
      * dst 로 등록하고 RX collector 를 띄운다. 멱등(같은 bearer 재등록 no-op). default [bearer] 는 건드리지
      * 않는다(측위 RX·group 제어 채널 보존). 등록 후 그 dst 로 가는 TX/RX 는 registered bearer 를 탄다.
      */
-    fun registerBearer(destination: Address, meshBearer: MeshBearer) = synchronized(bearersLock) {
+    fun registerBearer(destination: Address, meshBearer: MeshBearer, ttl: UByte? = null) = synchronized(bearersLock) {
+        // simdo-fork (2026-10-05) — 목적지별 요청 TTL. 이 목적지로 TTL 을 정하지 않고(null) 보내는 메시지·이 목적지가 보낸 분할의
+        // Segment Acknowledgment 가 이 값을 쓴다 ([ttlOverrideFor]). null = 종전(로컬 노드 Default TTL → 네트워크 파라미터).
+        _ttlOverrides = if (ttl == null) _ttlOverrides - destination else _ttlOverrides + (destination to ttl)
         if (_bearers[destination] === meshBearer) return@synchronized
         // 같은 dst 에 이전 bearer 가 있었다면 그 collector 를 먼저 정리(누수 방지).
         bearerCollectorJobs.remove(destination)?.cancel()
-        if (rxClosed) {
+        if (rxClosed || meshBearer is AdvertisingBearer) {
             // 은퇴해 수신이 닫힌 스택 — TX 라우팅만 기록하고 collector 는 띄우지 않는다.
+            // simdo-fork (2026-10-05) — 광고 베어러도 송신 경로만 기록한다. 수신은 [attachReceiver] 한 번 (같은 공중 수신을
+            // 엘리먼트 수만큼 처리하지 않게 — 5엘리먼트 조명 4대 동시 설정이면 20배였다).
             _bearers = _bearers + (destination to meshBearer)
             return@synchronized
         }
@@ -321,12 +342,55 @@ internal class NetworkManager internal constructor(
      * 이후 그 dst 로 가는 TX/RX 는 다시 default [bearer] 로 떨어진다. 멱등.
      */
     fun unregisterBearer(destination: Address) = synchronized(bearersLock) {
+        _ttlOverrides = _ttlOverrides - destination
         if (_bearers[destination] == null) return@synchronized
         bearerCollectorJobs.remove(destination)?.cancel()
         _bearers = _bearers - destination
         logger?.i(LogCategory.BEARER) {
             "Unregistered per-dest bearer for 0x${destination.toHexString()}"
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // simdo-fork (2026-10-05, 커미셔닝 동글 "얇은 무선" 1단계) — 목적지별 TTL · 수신 전용 연결.
+
+    @Volatile
+    private var _ttlOverrides: Map<Address, UByte> = emptyMap()
+
+    /**
+     * [destination] 으로 TTL 을 정하지 않고 보내는 메시지의 TTL ([registerBearer] 의 `ttl`). 없으면 null — 종전대로 로컬 노드 Default TTL.
+     * 광고 베어러로 직접 닿는 목적지에 요청을 작게 flood 하려고 쓴다 (설계 §9.1·9.2). 등록 해제하면 사라진다.
+     */
+    internal fun ttlOverrideFor(destination: Address): UByte? = _ttlOverrides[destination]
+
+    /** 수신 전용 연결 → 그 수집기 (은퇴해 수신이 닫혔으면 null). 동일성 기준. [channelLock] 안에서만 바꾼다. */
+    private val receivers = java.util.IdentityHashMap<MeshBearer, kotlinx.coroutines.Job?>()
+
+    /** 테스트·진단용 — 지금 살아 있는 수신 수집기 수 (기본 베어러 + 목적지별 + 수신 전용). */
+    internal val rxCollectorCount: Int
+        get() = synchronized(channelLock) {
+            listOfNotNull(bearerCollectorJob).count { it.isActive } +
+                bearerCollectorJobs.values.count { it.isActive } +
+                receivers.values.count { it?.isActive == true }
+        }
+
+    /**
+     * [receiver] 의 `pdus` 를 이 스택에 한 번 붙인다 (송신 경로는 만들지 않는다). 광고 베어러용 — 목적지별 등록은 송신만 정하고,
+     * 수신은 이 연결 하나로 받는다. 기본 베어러가 아니므로 Secure Network Beacon 은 IV 판정에만 쓰인다(프록시 필터를 건드리지 않음).
+     * 멱등.
+     */
+    internal fun attachReceiver(receiver: MeshBearer) = synchronized(channelLock) {
+        if (receivers.containsKey(receiver) && (rxClosed || receivers[receiver]?.isActive == true)) return@synchronized
+        receivers[receiver]?.cancel()
+        receivers[receiver] = if (rxClosed) null else awaitBearerPdus(bearer = receiver, viaDefaultBearer = false)
+        logger?.i(LogCategory.BEARER) { "Attached receive-only bearer (${receiver::class.simpleName})" }
+    }
+
+    /** [attachReceiver] 를 되돌린다. 멱등. */
+    internal fun detachReceiver(receiver: MeshBearer) = synchronized(channelLock) {
+        if (!receivers.containsKey(receiver)) return@synchronized
+        receivers.remove(receiver)?.cancel()
+        logger?.i(LogCategory.BEARER) { "Detached receive-only bearer (${receiver::class.simpleName})" }
     }
 
     val meshNetwork: MeshNetwork
@@ -380,12 +444,21 @@ internal class NetworkManager internal constructor(
      */
     private fun awaitBearerPdus(bearer: MeshBearer?, viaDefaultBearer: Boolean): kotlinx.coroutines.Job? {
         val pdus = bearer?.pdus ?: return null
+        // simdo-fork (2026-10-05) — 광고 베어러로 온 PDU 는 네트워크 계층이 해독 직후 목적지를 거른다 ([AdvertisingBearer]).
+        val viaAdvertisingBearer = bearer is AdvertisingBearer
         // simdo-fork (2026-09-28) — UNDISPATCHED: `collect` 가 SharedFlow 구독을 등록한 뒤에야 이 함수가
         // 반환된다. 교체·재구독 직후 곧바로 옛 collector 를 끊어도 구독자 0 인 순간이 생기지 않는다
         // (`pdus` 는 replay 없는 SharedFlow — 구독자 0 일 때 emit 된 PDU 는 사라진다).
         return scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
             pdus.collect {
-                runCatching { handle(incomingPdu = it.data, type = it.type, viaDefaultBearer = viaDefaultBearer) }
+                runCatching {
+                    handle(
+                        incomingPdu = it.data,
+                        type = it.type,
+                        viaDefaultBearer = viaDefaultBearer,
+                        viaAdvertisingBearer = viaAdvertisingBearer,
+                    )
+                }
                     .onFailure { throwable ->
                         logger?.e(LogCategory.BEARER) { "Bearer error: $throwable" }
                     }
@@ -412,10 +485,16 @@ internal class NetworkManager internal constructor(
      * @param type        PDU type.
      * @param viaDefaultBearer simdo-fork (2026-09-29) — 기본 베어러로 왔는가 ([NetworkLayer.handle] 참조). 목적지별 등록 베어러의
      *   수집기만 false 를 넘긴다. 기본 true = 종전.
+     * @param viaAdvertisingBearer simdo-fork (2026-10-05) — [AdvertisingBearer] 로 왔는가 (목적지 거름). 기본 false = 종전.
      */
-    fun handle(incomingPdu: ByteArray, type: PduType, viaDefaultBearer: Boolean = true) {
+    fun handle(incomingPdu: ByteArray, type: PduType, viaDefaultBearer: Boolean = true, viaAdvertisingBearer: Boolean = false) {
         scope.launch {
-            networkLayer.handle(incomingPdu = incomingPdu, type = type, viaDefaultBearer = viaDefaultBearer)
+            networkLayer.handle(
+                incomingPdu = incomingPdu,
+                type = type,
+                viaDefaultBearer = viaDefaultBearer,
+                viaAdvertisingBearer = viaAdvertisingBearer,
+            )
                 ?.let {
                     if (it.message is ProxyConfigurationMessage) {
                         _incomingProxyMessages.emit(value = it)

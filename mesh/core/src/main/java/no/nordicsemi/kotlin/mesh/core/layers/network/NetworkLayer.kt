@@ -7,6 +7,7 @@ import no.nordicsemi.kotlin.mesh.bearer.BearerError
 import no.nordicsemi.kotlin.mesh.bearer.PduType
 import no.nordicsemi.kotlin.mesh.bearer.gatt.GattBearer
 import no.nordicsemi.kotlin.mesh.core.ProxyFilter
+import no.nordicsemi.kotlin.mesh.core.ProxyFilterType
 import no.nordicsemi.kotlin.mesh.core.layers.NetworkManager
 import no.nordicsemi.kotlin.mesh.core.layers.ReceivedMessage
 import no.nordicsemi.kotlin.mesh.core.layers.lowertransport.AccessMessage
@@ -62,11 +63,23 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
      * 갱신 판정과 메시 메시지 처리는 어느 링크로 왔든 같다(망 상태는 하나). 등록이 없으면 모든 PDU 가 기본 베어러로 오므로
      * 종전과 동작이 같다.
      *
+     * simdo-fork (2026-10-05, 커미셔닝 동글 "얇은 무선" 1단계) — [viaAdvertisingBearer]: 광고 베어러([no.nordicsemi.kotlin.mesh.bearer.AdvertisingBearer])
+     * 로 왔는가. 광고 베어러에는 프록시 필터가 없어 망의 모든 메시지가 들어온다. 해독 직후 목적지가 로컬 노드가 받을 주소
+     * ([acceptsOnAdvertisingBearer]) 가 아니면 버린다 — 하위 전송 계층으로 가지 않으므로 (1) 남의 목적지 메시지가 해독·재조립되어 앱
+     * 수신 흐름으로 나가지 않고 (2) 남의 목적지 분할 메시지가 재조립 버퍼(`incompleteSegments`) 에 들어가지 않는다 — 그 칸은 SAR Discard
+     * 타이머가 우리 목적지일 때만 걸리므로 영원히 남았다. 버린 PDU 는 2단 캐시(SRC·SEQ)에 기록하지 않는다.
+     *
      * @param incomingPdu  Data received.
      * @param type         PDU type.
      * @param viaDefaultBearer 기본 베어러로 왔는가 (기본 true — 루프백·종전 호출자).
+     * @param viaAdvertisingBearer 광고 베어러로 왔는가 (기본 false = 종전).
      */
-    suspend fun handle(incomingPdu: ByteArray, type: PduType, viaDefaultBearer: Boolean = true): ReceivedMessage? {
+    suspend fun handle(
+        incomingPdu: ByteArray,
+        type: PduType,
+        viaDefaultBearer: Boolean = true,
+        viaAdvertisingBearer: Boolean = false,
+    ): ReceivedMessage? {
         // Discard provisioning pdus as they are handled by the provisioning manager
         if (type == PduType.PROVISIONING_PDU) return null
 
@@ -75,7 +88,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             // Ensure the PDU has not been handled already (Network Message Cache, stage 1:
             // byte-identical repeats such as Network Transmit copies).
             require(!networkMessageCache.isDuplicateRawPdu(incomingPdu)) {
-                logger?.d(LogCategory.NETWORK) { "PDU already handled" }
+                // 광고 베어러는 Network Transmit 사본마다 온다 — 로그 수준을 낮춘다.
+                if (viaAdvertisingBearer) logger?.v(LogCategory.NETWORK) { "PDU already handled" }
+                else logger?.d(LogCategory.NETWORK) { "PDU already handled" }
                 return null
             }
         }
@@ -89,6 +104,13 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                     meshNetwork = meshNetwork
                 )
                 return if (networkPdu != null) {
+                    // simdo-fork (2026-10-05) — 광고 베어러: 해독 직후 목적지 거름 (위 KDoc). 2단 캐시 앞이라 버린 PDU 는 기록하지 않는다.
+                    if (viaAdvertisingBearer && !acceptsOnAdvertisingBearer(networkPdu)) {
+                        logger?.v(LogCategory.NETWORK) {
+                            "Advertising bearer: not for us (dst: ${networkPdu.destination.address.toHexString()}) — dropped"
+                        }
+                        return null
+                    }
                     // Network Message Cache, stage 2 (Section 3.4.6.4): relay copies carry a
                     // decremented TTL and therefore different wire bytes, so they pass stage 1.
                     // Identify them by SRC + IV Index + SEQ after decoding.
@@ -113,7 +135,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                         )
                     }
                 } else {
-                    logger?.w(LogCategory.NETWORK) { "Failed to decrypt network pdu" }
+                    // 광고 베어러는 다른 망(같은 공중의 다른 현장·계정) 메시지도 받는다 — 경고가 아니다.
+                    if (viaAdvertisingBearer) logger?.v(LogCategory.NETWORK) { "Failed to decrypt network pdu" }
+                    else logger?.w(LogCategory.NETWORK) { "Failed to decrypt network pdu" }
                     null
                 }
             }
@@ -509,6 +533,34 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
     }
 
     /**
+     * simdo-fork (2026-10-05) — 광고 베어러로 온 [networkPdu] 를 로컬 노드가 받는가. 받는 것:
+     *  - 로컬 노드 엘리먼트의 유니캐스트 주소,
+     *  - All Nodes(0xFFFF),
+     *  - 로컬 노드 모델이 구독한 그룹·가상 주소,
+     *  - 기본 링크 프록시 필터가 통과시켰을 주소 (수락 목록이면 그 목록에 있는 주소, 거부 목록이면 목록에 없는 주소).
+     *
+     * 마지막 항목은 기본 링크(GATT 프록시)로 받던 것을 광고 베어러가 먼저 받아 1단 캐시(원본 바이트)에 기록하는 경우를 막는다 — 같은
+     * 바이트의 프록시 사본이 "이미 처리함" 으로 버려지므로, 프록시가 넘겨 줄 메시지는 여기서도 받아야 수신이 줄지 않는다.
+     */
+    internal fun acceptsOnAdvertisingBearer(networkPdu: NetworkPdu): Boolean {
+        val destination = networkPdu.destination
+        val address = destination.address
+        if (destination is UnicastAddress) return isLocalUnicastAddress(address)
+        if (address == ALL_NODES_ADDRESS) return true
+        val localNode = meshNetwork.localProvisioner?.node
+        val subscribed = runCatching {
+            localNode?.elements?.any { element -> element.models.any { model -> model.subscribe.any { it.address == address } } } == true
+        }.getOrDefault(false)
+        if (subscribed) return true
+        val filter = networkManager.proxy as? ProxyFilter ?: return false
+        val listed = runCatching { filter.addresses.toList().any { it.address == address } }.getOrDefault(false)
+        return when (filter.type) {
+            ProxyFilterType.ACCEPT_LIST -> listed
+            ProxyFilterType.REJECT_LIST -> !listed
+        }
+    }
+
+    /**
      * Check whether the given address is an address of an element belonging to the local Node.
      *
      * @param address Address to check.
@@ -533,6 +585,11 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
      * @param networkPdu Network PDU to check.
      * @return `true` if the PDU should be looped back or `false` otherwise.
      */
+    private companion object {
+        /** Mesh Profile 3.4.2.4 fixed group "all-nodes". */
+        const val ALL_NODES_ADDRESS: UShort = 0xFFFFu
+    }
+
     private fun shouldLoopback(networkPdu: NetworkPdu) = networkPdu.destination is GroupAddress ||
             networkPdu.destination is VirtualAddress ||
             networkPdu.destination.takeIf { it is UnicastAddress }?.let { address ->
@@ -540,4 +597,3 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
             } ?: false
 
 }
-
