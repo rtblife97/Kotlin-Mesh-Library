@@ -266,7 +266,9 @@ data class NetworkParameters(
     var acknowledgementMessageTimeInterval: Duration
         get() = _acknowledgementMessageInterval
         set(value) {
-            _acknowledgementMessageInterval = max(2.0, value.toDouble(DurationUnit.SECONDS))
+            // simdo-fork (2026-10-05) — 하한 2 s → 0.2 s. 광고 베어러로 1홉 직결(동글, TTL 3) 송신할 때 실측 왕복이 0.1 s 인데
+            // 첫 재전송이 3.2 s 라 유실 1건이 3.2~6.4 s 를 먹었다. 상위(앱)가 경로에 맞게 값을 고른다 — 다중 홉 프록시 경로는 종전 3 s.
+            _acknowledgementMessageInterval = max(0.2, value.toDouble(DurationUnit.SECONDS))
                 .seconds
         }
 
