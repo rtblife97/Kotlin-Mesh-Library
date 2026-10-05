@@ -385,6 +385,23 @@ class ProvisioningManager(
             logger?.v(LogCategory.PROVISIONING) { "Sending $data" }
             send(request = data)
 
+            // simdo-fork (2026-10-05) — Provisioning Data 가 **전달된 뒤**(베어러 send 가 돌아옴: PB-ADV 는 상대 Transaction Ack)
+            // 기기는 키·주소를 이미 가졌다. 여기서 Complete 를 못 받고 흐름이 끝나면(시간 초과·링크 닫힘) 종전에는 장치 키를 버려
+            // 기기가 "우리 망에 등록됐지만 아무도 설정·초기화할 수 없는" 고아가 됐다 (실기기 2026-10-05: 폰이 포기한 0.1 s 뒤 Complete).
+            // 노드를 지금 만들어 [deliveredNode] 로 내놓는다 — 호출자가 실패 처리에서 [commitDeliveredNode] 로 살린다.
+            // NPPI(기존 노드 갱신) 는 제외: 실패해도 옛 키로 닿는다.
+            if (nodeProvisioningProtocolInterfaceTarget == null) {
+                deliveredNode = Node(
+                    name = unprovisionedDevice.name,
+                    uuid = unprovisionedDevice.uuid,
+                    deviceKey = provisioningData.deviceKey,
+                    unicastAddress = configuration.unicastAddress,
+                    elementCount = capabilities.numberOfElements,
+                    assignedNetworkKey = configuration.networkKey,
+                    security = provisioningData.security
+                )
+            }
+
             awaitComplete().also {
                 emit(value = ProvisioningState.Complete)
 
@@ -442,11 +459,42 @@ class ProvisioningManager(
                     meshNetwork.remove(uuid = node.uuid)
                     meshNetwork.add(node = node)
                 }
+                deliveredNodeCommitted = true
             }
 
         } catch (error: RemoteError) {
             emit(ProvisioningState.Failed(error))
         }
+    }
+
+    /**
+     * simdo-fork (2026-10-05) — Provisioning Data 가 기기에 전달된 뒤의 노드 (장치 키 포함). Data 전에는 null.
+     * Complete 를 받았으면 라이브러리가 이미 망에 넣었다([commitDeliveredNode] 는 no-op).
+     */
+    @Volatile
+    var deliveredNode: Node? = null
+        private set
+
+    @Volatile
+    private var deliveredNodeCommitted = false
+
+    /**
+     * simdo-fork (2026-10-05) — Complete 를 받지 못하고 끝난 프로비저닝을 살린다: [deliveredNode] 가 있으면 망에 넣고 돌려준다.
+     * 기기가 Provisioning Failed 로 거절한 경우(RemoteError)에는 부르지 말 것 — 기기는 등록되지 않았다.
+     *
+     * @return 망에 들어간 노드, Data 가 전달되기 전이면 null.
+     */
+    @OptIn(kotlin.uuid.ExperimentalUuidApi::class)
+    suspend fun commitDeliveredNode(): Node? {
+        val node = deliveredNode ?: return null
+        if (!deliveredNodeCommitted) {
+            meshNetwork.withCdbLock {
+                meshNetwork.remove(uuid = node.uuid)
+                meshNetwork.add(node = node)
+            }
+            deliveredNodeCommitted = true
+        }
+        return node
     }
 
     /**
