@@ -194,7 +194,8 @@ class MeshNetworkManager(
      * [bearer] 가 [no.nordicsemi.kotlin.mesh.bearer.AdvertisingBearer] 면 송신 경로만 등록한다 — 수신은 [attachAdvertisingReceiver].
      */
     fun registerBearer(destination: Address, bearer: MeshBearer, ttl: UByte?): Boolean {
-        require(ttl == null || ttl in 2u..127u) { "TTL $ttl (2..127)" }
+        // simdo-fork (2026-10-06) — TTL 0 허용(스펙상 유효: 중계되지 않음, 수신 노드는 TTL 0 으로 응답 — Zephyr net.c:803). 동글 1홉 실험.
+        require(ttl == null || ttl == 0.toUByte() || ttl in 2u..127u) { "TTL $ttl (0, 2..127)" }
         val nm = networkManager ?: return false
         nm.registerBearer(destination = destination, meshBearer = bearer, ttl = ttl)
         return true
