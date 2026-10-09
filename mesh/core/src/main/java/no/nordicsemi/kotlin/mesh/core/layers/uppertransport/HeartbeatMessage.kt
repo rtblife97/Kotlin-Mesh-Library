@@ -4,6 +4,7 @@ package no.nordicsemi.kotlin.mesh.core.layers.uppertransport
 
 import no.nordicsemi.kotlin.data.getUShort
 import no.nordicsemi.kotlin.data.toByteArray
+import no.nordicsemi.kotlin.mesh.core.ReceivedHeartbeat
 import no.nordicsemi.kotlin.mesh.core.exception.InvalidPdu
 import no.nordicsemi.kotlin.mesh.core.layers.lowertransport.ControlMessage
 import no.nordicsemi.kotlin.mesh.core.model.Features
@@ -40,6 +41,26 @@ internal class HeartbeatMessage(
         get() = receivedTtl?.let {
                     (initialTtl + 1u - it).toUByte()
                 } ?: 0u
+
+    /**
+     * simdo-fork (2026-10-09) — 수신 Heartbeat 를 공개 타입으로 옮긴다. Features 는 [features] 객체를
+     * 거치지 않고 PDU 원값을 그대로 쓴다 ([Features] 의 rawValue 생성자는 비트 해석이 틀리다).
+     * 송신용 메시지(receivedTtl == null)에는 쓰지 않는다 — RecvTTL 은 0 으로 둔다.
+     */
+    fun toReceivedHeartbeat(
+        receivedAtMillis: Long = System.currentTimeMillis(),
+    ): ReceivedHeartbeat = ReceivedHeartbeat(
+        source = source.address,
+        destination = destination.address,
+        initialTtl = initialTtl,
+        receivedTtl = receivedTtl ?: 0u,
+        hops = hops,
+        features = if (transportPdu.size >= 3) {
+            (((transportPdu[1].toInt() and 0xFF) shl 8) or (transportPdu[2].toInt() and 0xFF)).toUShort()
+        } else 0u,
+        ivIndex = ivIndex,
+        receivedAtMillis = receivedAtMillis,
+    )
 
     override fun toString() = receivedTtl?.let { receivedTtl ->
         "Heartbeat Message (initial TTL: $initialTtl, received TTL: $receivedTtl, " +

@@ -341,6 +341,9 @@ internal class UpperTransportLayer(private val networkManager: NetworkManager) :
      * @param heartbeat Received Heartbeat message.
      */
     private fun handle(heartbeat: HeartbeatMessage) {
+        // simdo-fork (2026-10-09) — 구독 일치와 무관하게 밖으로 내보낸다 ([ReceivedHeartbeat] KDoc).
+        // 구독 갱신이 예외를 내도 이 사실은 남도록 먼저 한다.
+        networkManager.onHeartbeatReceived(heartbeat.toReceivedHeartbeat())
         meshNetwork.localProvisioner?.node?.heartbeatSubscription?.updateIfMatches(heartbeat)
     }
 

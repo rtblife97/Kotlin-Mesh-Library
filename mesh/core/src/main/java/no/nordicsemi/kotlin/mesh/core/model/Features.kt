@@ -54,11 +54,15 @@ data class Features internal constructor(
      *
      * @param rawValue  Raw value of the features.
      */
+    // simdo-fork (2026-10-09) — 원본은 `from(rawValue shl n)` 이라 0 이 아닌 값이면 전부
+    // IllegalArgumentException 을 던졌다 (예: Relay 만 켠 0x0001 → friend 에 from(4)). 유일한 호출처인
+    // Heartbeat 수신 디코드(§3.6.5.10, bit0 Relay·bit1 Proxy·bit2 Friend·bit3 Low Power, 1 = 사용 중)가
+    // 중계 노드 Heartbeat 를 통째로 버리던 원인. 각 비트를 떼어 0 → Disabled, 1 → Enabled 로 읽는다.
     internal constructor(rawValue: UShort) : this(
-        _relay = Relay(state = FeatureState.from(value = rawValue.toInt() shl 0)),
-        _proxy = Proxy(state = FeatureState.from(value = rawValue.toInt() shl 1)),
-        _friend = Friend(state = FeatureState.from(value = rawValue.toInt() shl 2)),
-        _lowPower = LowPower(state = FeatureState.from(value = rawValue.toInt() shl 3))
+        _relay = Relay(state = FeatureState.from(value = (rawValue.toInt() shr 0) and 1)),
+        _proxy = Proxy(state = FeatureState.from(value = (rawValue.toInt() shr 1) and 1)),
+        _friend = Friend(state = FeatureState.from(value = (rawValue.toInt() shr 2) and 1)),
+        _lowPower = LowPower(state = FeatureState.from(value = (rawValue.toInt() shr 3) and 1))
     )
 
     /**

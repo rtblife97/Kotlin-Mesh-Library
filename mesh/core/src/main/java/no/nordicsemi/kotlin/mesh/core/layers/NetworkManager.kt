@@ -9,6 +9,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableSharedFlow
+import no.nordicsemi.kotlin.mesh.core.ReceivedHeartbeat
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
@@ -464,6 +465,17 @@ internal class NetworkManager internal constructor(
                     }
             }
         }
+    }
+
+    /**
+     * simdo-fork (2026-10-09) — 수신 Heartbeat 를 [MeshNetworkManager.heartbeats] 로 넘긴다.
+     *
+     * 교체 직후 은퇴 중(drain)인 옛 인스턴스도 같은 PDU 를 받으므로, 현재 활성 인스턴스일 때만 넘겨
+     * 한 Heartbeat 가 두 번 나가지 않게 한다.
+     */
+    internal fun onHeartbeatReceived(heartbeat: ReceivedHeartbeat) {
+        if (manager.networkManager !== this) return
+        manager.emitHeartbeat(heartbeat)
     }
 
     /**

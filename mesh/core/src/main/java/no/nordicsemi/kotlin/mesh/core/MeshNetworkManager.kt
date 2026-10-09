@@ -231,6 +231,23 @@ class MeshNetworkManager(
 
     val proxyFilter: ProxyFilter = ProxyFilter(scope = scope, manager = this)
 
+    // simdo-fork (2026-10-09) — 수신 Heartbeat 전부 (구독 일치 무관). NetworkManager 가 load/import 마다
+    // 바뀌어도 이 flow 는 이 객체에 있어 구독이 끊기지 않는다. replay 없음, 느린 수집자는 오래된 것부터 버린다.
+    private val _heartbeats = MutableSharedFlow<ReceivedHeartbeat>(
+        extraBufferCapacity = 256,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+
+    /**
+     * 이 스택이 복호한 Heartbeat 메시지 (Mesh Profile §3.6.7). 목적지가 로컬 노드든 그룹(sink)이든,
+     * 로컬 노드의 Heartbeat Subscription 과 일치하든 않든 모두 나온다.
+     */
+    val heartbeats: kotlinx.coroutines.flow.SharedFlow<ReceivedHeartbeat> = _heartbeats.asSharedFlow()
+
+    internal fun emitHeartbeat(heartbeat: ReceivedHeartbeat) {
+        _heartbeats.tryEmit(heartbeat)
+    }
+
     private val _attentionTimer = MutableSharedFlow<HealthAttentionTimer>()
     val attentionTimer = _attentionTimer.asSharedFlow()
 
