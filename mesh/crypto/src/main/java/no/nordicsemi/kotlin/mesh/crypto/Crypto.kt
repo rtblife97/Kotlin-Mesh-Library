@@ -29,7 +29,6 @@ import java.security.NoSuchProviderException
 import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.SecureRandom
-import java.security.Security
 import java.security.spec.InvalidKeySpecException
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
@@ -63,15 +62,14 @@ object Crypto {
     private val PRSN = "prsn".encodeToByteArray()
     private val PRDK = "prdk".encodeToByteArray()
 
-    init {
-        // First let's check if the BouncyCastle provider is already available
-        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) != null) {
-            // Remove any existing BouncyCastle provider
-            Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
-        }
-        // Install the provider
-        Security.insertProviderAt(BouncyCastleProvider(), 0)
-    }
+    /**
+     * BouncyCastle, used by passing this instance directly (simdo fork, 2026-10-13). The library used to *remove* the
+     * platform's built-in "BC" provider and insert the full one at the top of the global list. On Android the built-in "BC"
+     * supplies the default "BKS" KeyStore that Conscrypt needs to build the default SSLContext, so any HTTPS made after the
+     * first mesh crypto call failed with KeyStoreException "BKS not found" (field app 1.0.13, earlier :app on Android 15).
+     * Nothing here relies on the global list, so it is left alone.
+     */
+    private val bouncyCastle = BouncyCastleProvider()
 
     /**
      * Generates a 128-bit random key using a SecureRandom.
@@ -148,7 +146,7 @@ object Crypto {
     )
     fun calculateSharedSecret(privateKey: PrivateKey, publicKey: ByteArray): ByteArray {
         val devicePublicKey = calculateDeviceEcPublicKey(publicKey = publicKey) as ECPublicKey
-        return KeyAgreement.getInstance(privateKey.algorithm, BouncyCastleProvider.PROVIDER_NAME)
+        return KeyAgreement.getInstance(privateKey.algorithm, bouncyCastle)
             .let {
                 it.init(privateKey)
                 it.doPhase(devicePublicKey, true)
@@ -169,7 +167,7 @@ object Crypto {
         val ecParameters = ECNamedCurveTable.getParameterSpec("secp256r1")
         val ecPoint = ecParameters.curve.validatePoint(x, y)
         val keySpec = ECPublicKeySpec(ecPoint, ecParameters)
-        val keyFactory = KeyFactory.getInstance("ECDH", BouncyCastleProvider.PROVIDER_NAME)
+        val keyFactory = KeyFactory.getInstance("ECDH", bouncyCastle)
         return keyFactory.generatePublic(keySpec)
     }
 
