@@ -196,6 +196,8 @@ internal class NetworkManager internal constructor(
         from?.bearers?.forEach { (destination, registered) ->
             registerBearer(destination = destination, meshBearer = registered, ttl = from.ttlOverrideFor(destination))
         }
+        // simdo-fork (2026-10-14) — 베어러 등록 없이 건 목적지별 TTL ([setTtlOverride]) 도 옮긴다.
+        from?.ttlOnlyOverrides()?.forEach { (destination, ttl) -> setTtlOverride(destination, ttl) }
         // simdo-fork (2026-10-05) — 수신 전용 연결(광고 베어러)도 새 인스턴스로 옮긴다. MeshNetworkManager 가 목록을 들고 있다
         // (네트워크가 아직 없을 때 붙인 것도 load/import 뒤 이 경로로 들어온다).
         advertisingReceivers.forEach { attachReceiver(it) }
@@ -363,6 +365,23 @@ internal class NetworkManager internal constructor(
      * 광고 베어러로 직접 닿는 목적지에 요청을 작게 flood 하려고 쓴다 (설계 §9.1·9.2). 등록 해제하면 사라진다.
      */
     internal fun ttlOverrideFor(destination: Address): UByte? = _ttlOverrides[destination]
+
+    /**
+     * simdo-fork (2026-10-14, 커미셔닝 앱 1홉 TTL 0) — 베어러 등록 없이 [destination] 의 요청 TTL 만 건다 (null = 지운다). 송신은 그대로
+     * 기본 베어러([bearer]) 로 나간다. 메인 프록시 링크가 이미 그 노드에 직접 붙어 있을 때 쓴다 — 기본 베어러를 목적지별로 다시 등록하면
+     * 같은 링크에 수신 수집기가 하나 더 붙어 모든 PDU 를 두 번 처리한다. 적용 범위는 [registerBearer] 의 `ttl` 과 같다 (TTL 을 정하지 않은 요청·
+     * 재전송·그 노드가 보낸 분할의 Segment Acknowledgment). 그 목적지를 [registerBearer]·[unregisterBearer] 하면 그쪽 값이 이긴다.
+     */
+    fun setTtlOverride(destination: Address, ttl: UByte?) = synchronized(bearersLock) {
+        _ttlOverrides = if (ttl == null) _ttlOverrides - destination else _ttlOverrides + (destination to ttl)
+    }
+
+    /** 베어러 등록 없이 건 목적지별 TTL ([setTtlOverride]) — 스택 교체 때 옮긴다. */
+    private fun ttlOnlyOverrides(): Map<Address, UByte> = _ttlOverrides.filterKeys { !_bearers.containsKey(it) }
+
+    /** simdo-fork (2026-10-14) — 이 인스턴스가 지금 매니저의 스택인가 (은퇴 중인 옛 스택이면 false). 진단 카운터 중복 방지. */
+    internal val isActiveStack: Boolean
+        get() = manager.networkManager === this
 
     /** 수신 전용 연결 → 그 수집기 (은퇴해 수신이 닫혔으면 null). 동일성 기준. [channelLock] 안에서만 바꾼다. */
     private val receivers = java.util.IdentityHashMap<MeshBearer, kotlinx.coroutines.Job?>()

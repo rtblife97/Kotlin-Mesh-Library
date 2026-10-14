@@ -160,6 +160,46 @@ class NetworkManagerReplacementTest {
         }
 
     @Test
+    fun `TTL-only override adds no collector, survives reload, and clears`() = runBlocking {
+        val bearer = StubBearer()
+        val mgr = managerWithBearer(bearer)
+        mgr.import(cdb)
+        val dst = MeshAddress.create(0x0002).address
+
+        assertTrue(mgr.setDestinationTtl(dst, 0u))
+        assertEquals("기본 베어러 구독자 그대로", 1, bearer.settledSubscribers(1))
+        assertEquals(0.toUByte(), mgr.networkManager!!.ttlOverrideFor(dst))
+
+        mgr.import(cdb)
+        assertEquals("새 스택으로 옮겨짐", 0.toUByte(), mgr.networkManager!!.ttlOverrideFor(dst))
+        assertEquals(1, bearer.settledSubscribers(1))
+
+        mgr.setDestinationTtl(dst, null)
+        assertEquals(null, mgr.networkManager!!.ttlOverrideFor(dst))
+    }
+
+    @Test
+    fun `rx diagnostics count each default-bearer PDU once, also across a reload`() = runBlocking {
+        val bearer = StubBearer()
+        val mgr = managerWithBearer(bearer)
+        mgr.import(cdb)
+        mgr.import(cdb) // 옛 스택이 은퇴 중이어도 한 번만 센다
+        no.nordicsemi.kotlin.mesh.core.layers.network.NetworkRxDiagnostics.reset()
+
+        bearer.pduFlow.emit(wirePdu(mgr.network!!, sequence = 0x20u))
+        bearer.pduFlow.emit(wirePdu(mgr.network!!, sequence = 0x20u)) // 같은 PDU 재수신 = 중복 제거
+        bearer.pduFlow.emit(Pdu(data = ByteArray(20) { 0x11 }, type = PduType.NETWORK_PDU)) // 못 푸는 PDU
+        val snap = run {
+            awaitCount(2) { no.nordicsemi.kotlin.mesh.core.layers.network.NetworkRxDiagnostics.snapshot().pdus }
+            no.nordicsemi.kotlin.mesh.core.layers.network.NetworkRxDiagnostics.snapshot()
+        }
+        assertEquals(2, snap.pdus)
+        assertEquals(1, snap.undecryptable)
+        assertEquals(1, snap.sources)
+        assertTrue("Heartbeat 는 access opcode 없음", snap.opCodes.isEmpty())
+    }
+
+    @Test
     fun `concurrent same-bearer rewires never leave an extra collector`() = runBlocking {
         val bearer = StubBearer()
         val mgr = managerWithBearer(bearer)

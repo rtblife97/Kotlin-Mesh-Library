@@ -125,7 +125,15 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                         return null
                     }
                     logger?.i(LogCategory.NETWORK) { "$networkPdu received" }
-                    networkManager.lowerTransportLayer.handle(networkPdu = networkPdu)?.let {
+                    // simdo-fork (2026-10-14) — 공중 부하 탐침 카운터 (기본 링크·활성 스택만). 동작에는 영향 없음.
+                    val countRx = viaDefaultBearer && !viaAdvertisingBearer && networkManager.isActiveStack
+                    val upper = try {
+                        networkManager.lowerTransportLayer.handle(networkPdu = networkPdu)
+                    } finally {
+                        if (countRx) NetworkRxDiagnostics.recordDecoded(networkPdu.source.address.toInt())
+                    }
+                    if (countRx && upper != null) NetworkRxDiagnostics.recordOpCode(upper.opCode.toInt())
+                    upper?.let {
                         // simdo-patch: capture sequence/ivIndex/ttl from the Network PDU.
                         ReceivedMessage(
                             source = networkPdu.source,
@@ -137,6 +145,9 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                         )
                     }
                 } else {
+                    if (viaDefaultBearer && !viaAdvertisingBearer && networkManager.isActiveStack) {
+                        NetworkRxDiagnostics.recordUndecryptable()
+                    }
                     // 광고 베어러는 다른 망(같은 공중의 다른 현장·계정) 메시지도 받는다 — 경고가 아니다.
                     if (viaAdvertisingBearer) logger?.v(LogCategory.NETWORK) { "Failed to decrypt network pdu" }
                     else logger?.w(LogCategory.NETWORK) { "Failed to decrypt network pdu" }

@@ -201,6 +201,26 @@ class MeshNetworkManager(
         return true
     }
 
+    /**
+     * simdo-fork (2026-10-14, 커미셔닝 앱 1홉 TTL 0) — 베어러 등록 없이 [destination] 의 요청 TTL 만 건다 (null = 지운다). 송신은 기본 베어러
+     * ([meshBearer]) 그대로. 메인 프록시 링크가 그 노드에 직접 붙어 있을 때 TTL 0 으로 보내 노드도 TTL 0 으로 응답하게(중계 없음) 하는 용도.
+     * 허용 값은 [registerBearer] 와 같다. 네트워크를 다시 불러와도(load/import) 새 스택으로 옮겨진다.
+     *
+     * @return true = 걸었다, false = 네트워크 미로드.
+     */
+    fun setDestinationTtl(destination: Address, ttl: UByte?): Boolean {
+        require(ttl == null || ttl == 0.toUByte() || ttl in 2u..127u) { "TTL $ttl (0, 2..127)" }
+        val nm = networkManager ?: return false
+        nm.setTtlOverride(destination = destination, ttl = ttl)
+        return true
+    }
+
+    /**
+     * simdo-fork (2026-10-14) — 지금 스택에서 진행 중인 송신 수 (응답 대기 포함). 0 이 아니면 응답을 기다리는 요청이 있다. 진단·방어용.
+     */
+    val inFlightMessageCount: Int
+        get() = networkManager?.inFlightCount ?: 0
+
     /** 수신 전용 연결 목록 — 네트워크가 바뀌어(load/import) 새 스택이 생겨도 다시 붙인다. 동일성 기준. */
     private val advertisingReceivers: MutableSet<MeshBearer> =
         java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
