@@ -127,6 +127,8 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                     logger?.i(LogCategory.NETWORK) { "$networkPdu received" }
                     // simdo-fork (2026-10-14) — 공중 부하 탐침 카운터 (기본 링크·활성 스택만). 동작에는 영향 없음.
                     val countRx = viaDefaultBearer && !viaAdvertisingBearer && networkManager.isActiveStack
+                    // simdo-fork (2026-10-15) — 수신 경로 대기 측정 시작점 (하위 전송 잠금 대기 포함).
+                    val lowerTransportEnteredAt = System.nanoTime()
                     val upper = try {
                         networkManager.lowerTransportLayer.handle(networkPdu = networkPdu)
                     } finally {
@@ -142,6 +144,7 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                             sequence = networkPdu.sequence,
                             ivIndex = networkPdu.ivIndex,
                             ttl = networkPdu.ttl,
+                            lowerTransportEnteredAtNanos = lowerTransportEnteredAt,
                         )
                     }
                 } else {

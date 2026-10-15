@@ -9,6 +9,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableSharedFlow
+import no.nordicsemi.kotlin.mesh.core.PersistenceDiagnostics
 import no.nordicsemi.kotlin.mesh.core.ReceivedHeartbeat
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
@@ -451,7 +452,9 @@ internal class NetworkManager internal constructor(
     internal suspend fun emitIncomingMeshMessageForTest(message: ReceivedMessage) =
         _incomingMeshMessages.emit(value = message)
 
-    private val _networkManagerEventFlow = MutableSharedFlow<NetworkManagerEvent>()
+    // simdo-fork (2026-10-15) — 버퍼를 둔다. emit 하는 쪽(AccessLayer)은 하위 전송 잠금 안에 있으므로 수집기(MeshNetworkManager 의
+    // OnNetworkReset → clear())를 기다리면 안 된다. OnNetworkChanged 는 이 흐름을 거치지 않는다 ([emitNetworkManagerEvent]).
+    private val _networkManagerEventFlow = MutableSharedFlow<NetworkManagerEvent>(extraBufferCapacity = 16)
     override val networkManagerEventFlow
         get() = _networkManagerEventFlow.asSharedFlow()
 
@@ -503,6 +506,14 @@ internal class NetworkManager internal constructor(
      * @param event Network manager event.
      */
     override suspend fun emitNetworkManagerEvent(event: NetworkManagerEvent) {
+        // simdo-fork (2026-10-15) — 수신 경로에서 영속화 분리. 종전엔 OnNetworkChanged 가 버퍼 0 흐름을 거쳐 수집기에서 곧바로
+        // save()(망 전체 export + 파일 쓰기)로 이어졌고, 이 emit 은 AccessLayer → LowerTransportLayer.handle 의 잠금 안이라 앞 save 가
+        // 끝날 때까지 다음 수신(SegAck·분할 포함)이 줄을 섰다. 설정 왕복이 CDB 노드 수에 비례해 늘어난 근원(2026-10-15 진단).
+        // 이제 "더러움" 표시만 하고 저장은 MeshNetworkManager 의 합침 작업이 맡는다 (기다리지 않는다).
+        if (event == NetworkManagerEvent.OnNetworkChanged) {
+            manager.markNetworkDirty()
+            return
+        }
         _networkManagerEventFlow.emit(value = event)
     }
 
@@ -530,6 +541,13 @@ internal class NetworkManager internal constructor(
                     if (it.message is ProxyConfigurationMessage) {
                         _incomingProxyMessages.emit(value = it)
                     } else {
+                        // simdo-fork (2026-10-15) — 수신 경로 대기 측정 (하위 전송 진입 → 여기). 동작 영향 없음.
+                        if (it.lowerTransportEnteredAtNanos != 0L) {
+                            PersistenceDiagnostics.recordRxWait(
+                                source = it.source.address.toInt(),
+                                nanos = System.nanoTime() - it.lowerTransportEnteredAtNanos,
+                            )
+                        }
                         _incomingMeshMessages.emit(value = it)
                     }
                 }
@@ -937,4 +955,7 @@ internal data class ReceivedMessage(
     val sequence: UInt,
     val ivIndex: UInt,
     val ttl: UByte,
+    // simdo-fork (2026-10-15) — 이 메시지의 마지막 Network PDU 가 하위 전송 계층에 들어온 시각 (System.nanoTime, 0 = 모름).
+    // 수신 경로 대기([no.nordicsemi.kotlin.mesh.core.PersistenceDiagnostics]) 측정 전용.
+    val lowerTransportEnteredAtNanos: Long = 0L,
 )

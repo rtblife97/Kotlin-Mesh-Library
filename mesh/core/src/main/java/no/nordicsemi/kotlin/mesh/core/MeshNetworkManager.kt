@@ -4,6 +4,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -55,6 +56,8 @@ import no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer.
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.NetworkConfiguration
 import no.nordicsemi.kotlin.mesh.logger.LogCategory
 import no.nordicsemi.kotlin.mesh.logger.Logger
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.ExperimentalTime
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
@@ -410,6 +413,8 @@ class MeshNetworkManager(
         .load()
         .takeIf { it.isNotEmpty() }
         ?.let {
+            // simdo-fork (2026-10-15) — 망 교체 전 미뤄 둔 저장 flush (합침 저장).
+            flushBeforeReplacing(reason = "load")
             network = deserialize(it)
                 // Load the IvIndex from the secure properties' storage.
                 .apply { ivIndex = secureProperties.ivIndex(uuid = uuid) }
@@ -424,13 +429,140 @@ class MeshNetworkManager(
      */
     @OptIn(ExperimentalTime::class, ExperimentalUuidApi::class)
     suspend fun save() {
-        // simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
-        // export()=serialize 트래버설이 CDB mutable collection 을 순회한다.
-        // 병렬 config RX 가 동시에 write 중이면 CME → cdbMutex 로 트래버설을 직렬화.
-        // (cdbMutex 는 NetworkManager 소유; networkManager 미초기화 시 직렬 경로라 그냥 export.)
-        withCdbLock { export() }?.let {
-            mutex.withLock { storage.save(network = it) }
-            _networkEvents.emit(value = NetworkEvent.NetworkUpdated)
+        // simdo-fork (2026-10-15) — 명시 저장 = 즉시 flush. 합쳐 미뤄 둔 저장([markNetworkDirty])이 있으면 그것까지 포함해 지금
+        // 한 번 쓰고, 끝날 때까지 기다린다 (호출자는 "저장됐다" 를 전제한다: 조명 1대 설정 완료·프로비저닝 완료·import 뒤 등).
+        // 종전과 같이 쓰기가 끝나면 NetworkUpdated 를 낸다.
+        saveNow()
+    }
+
+    /**
+     * simdo-fork (2026-10-15) — 미뤄 둔 저장이 있으면 지금 쓴다 (없으면 아무것도 안 한다). 앱 백그라운드 진입 등 "곧 죽을 수 있다"
+     * 지점에서 부른다. 저장했으면 true.
+     */
+    suspend fun flushPendingSave(): Boolean {
+        if (!hasUnsavedChanges) return false
+        saveNow()
+        return true
+    }
+
+    /** simdo-fork (2026-10-15) — 메모리의 망이 파일보다 앞서 있는가 (합침 저장 대기 중). */
+    val hasUnsavedChanges: Boolean
+        get() = synchronized(dirtyLock) { dirty }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // simdo-fork (2026-10-15) — 수신 경로에서 영속화 분리 (합침 저장).
+    //
+    // 배경: 종전엔 Config Status 등 망 상태를 바꾸는 수신 메시지마다 AccessLayer 가 OnNetworkChanged 를 냈고 곧바로 save()(망 전체
+    //   export + 파일 통째 쓰기)가 돌았다. 그 대기가 LowerTransportLayer.handle 의 잠금 안에 걸려 다음 수신(SegAck·분할)과 응답 전달이
+    //   줄을 섰다. 조명 1대 ≈ 79회 저장, 설정 왕복 p50 = 62 ms + 0.47 ms × CDB 노드 수 (2026-10-15 현장 861건).
+    // 지금: 수신 경로는 "더러움" 표시만 한다([markNetworkDirty], 기다리지 않음). 저장은 마지막 변경 뒤 [saveDebounce] 동안 조용하면
+    //   1회, 계속 바뀌어도 첫 변경 뒤 [saveMaxDelay] 안에는 반드시 1회. 명시 flush 지점은 [save] / [flushPendingSave] (조명 설정 완료,
+    //   프로비저닝 완료, 앱 백그라운드, 망 교체·해제 전).
+    // 재생 보호: RPL(SeqAuth)·송신 SEQ·IV Index 는 이 파일이 아니라 SecurePropertiesStorage(앱 = Room)에 메시지마다 따로 쓰인다.
+    //   합침 창 안에서 앱이 죽어도 잃는 것은 CDB 의 노드 설정 표시뿐이고 재생 보호는 그대로다.
+    // 2026-06-05 cdbMutex: export 트래버설은 여전히 withCdbLock 안 (CME 방지). 2026-08-12 RPR 증폭 차단: RPR 은 여전히 더러움 표시조차
+    //   하지 않는다 (AccessLayer 의 mutatesNetworkState() 판정 그대로).
+
+    /** 마지막 변경 뒤 이만큼 조용하면 저장한다. */
+    var saveDebounce: Duration = DEFAULT_SAVE_DEBOUNCE
+
+    /** 변경이 계속 들어와도 첫 변경 뒤 이 안에는 저장한다. */
+    var saveMaxDelay: Duration = DEFAULT_SAVE_MAX_DELAY
+
+    private val dirtyLock = Any()
+    private var dirty = false
+    private var firstDirtyAtNanos = 0L
+    private var lastDirtyAtNanos = 0L
+    private var deferredSaveJob: Job? = null
+
+    /** 저장(export + 쓰기)·해제 쓰기를 한 줄로 세운다. 늦게 끝난 옛 저장이 해제(빈 파일)를 덮어쓰지 않게. */
+    private val persistLock = Mutex()
+
+    /**
+     * 망 상태가 바뀌었다 — 저장을 예약만 한다 (기다리지 않는다). 수신 경로(AccessLayer, 하위 전송 잠금 안)에서 부른다.
+     */
+    internal fun markNetworkDirty() {
+        synchronized(dirtyLock) {
+            val now = System.nanoTime()
+            if (!dirty) {
+                dirty = true
+                firstDirtyAtNanos = now
+            }
+            lastDirtyAtNanos = now
+            if (deferredSaveJob?.isActive != true) {
+                deferredSaveJob = scope.launch { runDeferredSaves() }
+            }
+        }
+    }
+
+    private suspend fun runDeferredSaves() {
+        while (true) {
+            // 조용한 시간·상한 중 먼저 오는 쪽까지 기다린다. 기다리는 사이 명시 저장이 먼저 했으면(dirty=false) 끝.
+            while (true) {
+                val waitNanos = synchronized(dirtyLock) {
+                    if (!dirty) {
+                        deferredSaveJob = null
+                        return
+                    }
+                    val now = System.nanoTime()
+                    minOf(
+                        lastDirtyAtNanos + saveDebounce.inWholeNanoseconds - now,
+                        firstDirtyAtNanos + saveMaxDelay.inWholeNanoseconds - now,
+                    )
+                }
+                if (waitNanos <= 0) break
+                delay((waitNanos + 999_999) / 1_000_000)
+            }
+            runCatching { saveNow() }.onFailure {
+                if (it is kotlinx.coroutines.CancellationException) throw it
+                logger?.e(category = LogCategory.FOUNDATION_MODEL) {
+                    "Deferred network save failed (will retry after ${saveDebounce}): ${it::class.simpleName}: ${it.message}"
+                }
+            }
+            // 저장하는 동안 새 변경이 들어왔으면 다음 바퀴, 아니면 끝 (끝내기 판정은 위 잠금 안에서).
+        }
+    }
+
+    /** 지금 저장한다: 더러움을 지우고 export(CDB 잠금 안) → 파일 쓰기 → NetworkUpdated. 실패하면 더러움을 되살린다. */
+    private suspend fun saveNow() {
+        val saved = persistLock.withLock {
+            synchronized(dirtyLock) { dirty = false }
+            try {
+                // simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
+                // export()=serialize 트래버설이 CDB mutable collection 을 순회한다.
+                // 병렬 config RX 가 동시에 write 중이면 CME → cdbMutex 로 트래버설을 직렬화.
+                // (cdbMutex 는 NetworkManager 소유; networkManager 미초기화 시 직렬 경로라 그냥 export.)
+                var exportNanos = 0L
+                val bytes = withCdbLock {
+                    val t0 = System.nanoTime()
+                    export().also { exportNanos = System.nanoTime() - t0 }
+                } ?: return@withLock false
+                mutex.withLock { storage.save(network = bytes) }
+                PersistenceDiagnostics.recordSave(exportNanos)
+                true
+            } catch (e: Throwable) {
+                synchronized(dirtyLock) {
+                    val now = System.nanoTime()
+                    if (!dirty) {
+                        dirty = true
+                        firstDirtyAtNanos = now
+                    }
+                    lastDirtyAtNanos = now
+                }
+                throw e
+            }
+        }
+        // 잠금 밖에서 낸다 — 구독자가 이 이벤트를 받고 save() 를 불러도 교착하지 않게.
+        if (saved) _networkEvents.emit(value = NetworkEvent.NetworkUpdated)
+    }
+
+    /** 망 교체 전: 옛 망의 미뤄 둔 저장을 먼저 쓴다 (실패는 기록만 — 교체를 막지 않는다). */
+    private suspend fun flushBeforeReplacing(reason: String) {
+        runCatching { flushPendingSave() }.onFailure {
+            if (it is kotlinx.coroutines.CancellationException) throw it
+            logger?.w(category = LogCategory.FOUNDATION_MODEL) {
+                "Pending network save before $reason failed: ${it::class.simpleName}: ${it.message}"
+            }
         }
     }
 
@@ -499,6 +631,8 @@ class MeshNetworkManager(
             }
         }
 
+        // simdo-fork (2026-10-15) — 망 교체 전 미뤄 둔 저장 flush (합침 저장).
+        flushBeforeReplacing(reason = "create")
         return MeshNetwork(uuid = uuid, _name = name).also { network ->
             if (networkKeys.isNotEmpty()) {
                 networkKeys.forEachIndexed { index, key ->
@@ -532,8 +666,11 @@ class MeshNetworkManager(
     suspend fun clear() {
         networkManager = null
         network = null
+        // simdo-fork (2026-10-15) — 해제한 망의 미뤄 둔 저장은 버린다 (곧 빈 파일로 덮는다).
+        synchronized(dirtyLock) { dirty = false }
         _networkEvents.emit(value = NetworkEvent.NetworkUpdated)
-        mutex.withLock { storage.save(network = byteArrayOf()) }
+        // 진행 중인 옛 저장이 끝난 뒤 빈 파일을 쓴다 (persistLock) — 늦게 끝난 옛 저장이 해제를 되살리지 않게.
+        persistLock.withLock { mutex.withLock { storage.save(network = byteArrayOf()) } }
     }
 
     /**
@@ -546,6 +683,8 @@ class MeshNetworkManager(
     @OptIn(ExperimentalUuidApi::class)
     @Throws(ImportError::class)
     suspend fun import(array: ByteArray) = runCatching {
+        // simdo-fork (2026-10-15) — 망 교체 전 옛 망의 미뤄 둔 저장 flush (합침 저장). 실패해도 import 는 진행.
+        flushBeforeReplacing(reason = "import")
         deserialize(array)
             // simdo-fork (2026-08-11) — IV Index 복원. `MeshNetwork.ivIndex` 는 @Transient 이고
             // CDB Profile 스키마에도 최상위 ivIndex 가 없으므로 deserialize 결과는 항상 IvIndex(0).
@@ -1455,7 +1594,8 @@ class MeshNetworkManager(
                 networkManagerEventObserver = networkManager?.networkManagerEventFlow
                     ?.onEach {
                         when (it) {
-                            NetworkManagerEvent.OnNetworkChanged -> save()
+                            // simdo-fork (2026-10-15) — NetworkManager 가 이 흐름 대신 markNetworkDirty() 를 직접 부른다. 남은 경로도 합침 저장으로.
+                            NetworkManagerEvent.OnNetworkChanged -> markNetworkDirty()
                             NetworkManagerEvent.OnNetworkReset ->
                                 network?.localProvisioner?.let { provisioner ->
                                     clear()
@@ -1507,5 +1647,13 @@ class MeshNetworkManager(
                 }
             }
         }
+    }
+
+    companion object {
+        /** simdo-fork (2026-10-15) — 합침 저장 기본값: 마지막 변경 뒤 조용한 시간. */
+        val DEFAULT_SAVE_DEBOUNCE: Duration = 2.seconds
+
+        /** simdo-fork (2026-10-15) — 합침 저장 기본값: 첫 변경 뒤 상한. */
+        val DEFAULT_SAVE_MAX_DELAY: Duration = 10.seconds
     }
 }

@@ -673,6 +673,8 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                     // 는 순수 pass-through) 저장은 의미상으로도 틀렸고, 10초 스캔 세션 30기기 =
                     // 네트워크 전체 직렬화 30회, 기기 1대 PB-Remote 프로비저닝 ≈ 10회가 된다.
                     // 판정은 mutatesNetworkState() 한 곳에 모아 테스트로 봉인한다.
+                    // simdo-fork (2026-10-15) — 이 emit 은 이제 save() 가 아니라 "더러움" 표시다 (NetworkManager.emitNetworkManagerEvent →
+                    // MeshNetworkManager.markNetworkDirty, 기다리지 않음). 저장은 합쳐서 수 초 안에 1회. 판정(RPR 제외)은 그대로다.
                     if (message.mutatesNetworkState()) {
                         networkManager.emitNetworkManagerEvent(event = NetworkManagerEvent.OnNetworkChanged)
                     }
