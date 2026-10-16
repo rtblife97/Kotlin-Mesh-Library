@@ -54,6 +54,46 @@ object NetworkRxDiagnostics {
         bySource.getOrPut(source) { AtomicInteger(0) }.incrementAndGet()
     }
 
+    /**
+     * simdo 2026-10-17 — 게이트웨이 수신 카운터용 Network PDU 한 건. 네트워크 키로 풀린 직후, 2단 캐시(SRC·SEQ) **앞**에서
+     * 나오므로 같은 SEQ 의 중계 사본도 각각 나온다 (중복 판정은 듣는 쪽이 한다). 세는 범위는 [recordDecoded] 와 같다
+     * (기본 링크·활성 스택). 1단 캐시(바이트 동일 반복)에서 걸린 PDU 는 해독 전이라 나오지 않는다.
+     *
+     * @property heartbeatInitTtl 비분할 제어 메시지 Heartbeat(opcode 0x0A, Mesh Profile 1.0.1 §3.6.5.10) 면 그 InitTTL, 아니면 null.
+     */
+    data class Record(
+        val source: Int,
+        val destination: Int,
+        val sequence: Long,
+        val ivIndex: Long,
+        val ttl: Int,
+        val heartbeatInitTtl: Int?,
+    )
+
+    /** 수신 PDU 를 받을 곳 (없으면 null). 네트워크 계층 수신 코루틴에서 바로 부르므로 가볍게 처리하고 던지지 말 것. */
+    @Volatile
+    var listener: ((Record) -> Unit)? = null
+
+    internal fun tap(pdu: NetworkPdu) {
+        val l = listener ?: return
+        val t = pdu.transportPdu
+        val hbInitTtl = if (pdu.type == no.nordicsemi.kotlin.mesh.core.layers.lowertransport.LowerTransportPduType.CONTROL_MESSAGE &&
+            !pdu.isSegmented && t.size >= 4 && (t[0].toInt() and 0x7F) == 0x0A
+        ) t[1].toInt() and 0x7F else null
+        runCatching {
+            l(
+                Record(
+                    source = pdu.source.address.toInt(),
+                    destination = pdu.destination.address.toInt(),
+                    sequence = pdu.sequence.toLong(),
+                    ivIndex = pdu.ivIndex.toLong(),
+                    ttl = pdu.ttl.toInt(),
+                    heartbeatInitTtl = hbInitTtl,
+                )
+            )
+        }
+    }
+
     /** 상위 계층까지 풀린 메시지 하나의 [opCode] (분할이면 재조립이 끝났을 때 한 번). */
     internal fun recordOpCode(opCode: Int) {
         byOpCode.getOrPut(opCode) { AtomicInteger(0) }.incrementAndGet()

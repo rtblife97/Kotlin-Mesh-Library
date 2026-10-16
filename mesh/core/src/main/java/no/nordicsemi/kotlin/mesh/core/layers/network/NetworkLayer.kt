@@ -116,6 +116,8 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                     // Network Message Cache, stage 2 (Section 3.4.6.4): relay copies carry a
                     // decremented TTL and therefore different wire bytes, so they pass stage 1.
                     // Identify them by SRC + IV Index + SEQ after decoding.
+                    // simdo-fork (2026-10-17) — 게이트웨이 수신 카운터: 캐시 앞에서 사본까지 넘긴다. 동작 무영향.
+                    if (viaDefaultBearer && !viaAdvertisingBearer && networkManager.isActiveStack) NetworkRxDiagnostics.tap(networkPdu)
                     require(!networkMessageCache.isDuplicateSequence(networkPdu)) {
                         logger?.d(LogCategory.NETWORK) {
                             "Duplicate Network PDU (src: " +
