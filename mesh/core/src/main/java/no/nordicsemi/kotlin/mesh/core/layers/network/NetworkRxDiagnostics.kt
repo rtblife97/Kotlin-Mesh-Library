@@ -76,22 +76,30 @@ object NetworkRxDiagnostics {
 
     internal fun tap(pdu: NetworkPdu) {
         val l = listener ?: return
+        runCatching { l(toRecord(pdu)) }
+    }
+
+    /**
+     * simdo 2026-10-17 — 공중 측정용 공개 복호 (게이트웨이 동글 경로 A). 광고로 들은 Network PDU(AD 0x2A 본문)를 lib 수신과 같은
+     * [NetworkPduDecoder] 로 풀어 헤더만 돌려준다. 망 상태·메시지 캐시·RPL·IV 는 건드리지 않고, 남의 목적지 PDU 도 그대로 풀린다.
+     * 우리 망 키로 안 풀리면 null. 암호 연산은 lib 와 같은 [no.nordicsemi.kotlin.mesh.crypto.Crypto] (호출마다 새 AES 엔진).
+     */
+    fun decodeForDiagnostics(pdu: ByteArray, network: no.nordicsemi.kotlin.mesh.core.model.MeshNetwork): Record? =
+        runCatching { NetworkPduDecoder.decode(pdu, no.nordicsemi.kotlin.mesh.bearer.PduType.NETWORK_PDU, network)?.let(::toRecord) }.getOrNull()
+
+    private fun toRecord(pdu: NetworkPdu): Record {
         val t = pdu.transportPdu
         val hbInitTtl = if (pdu.type == no.nordicsemi.kotlin.mesh.core.layers.lowertransport.LowerTransportPduType.CONTROL_MESSAGE &&
             !pdu.isSegmented && t.size >= 4 && (t[0].toInt() and 0x7F) == 0x0A
         ) t[1].toInt() and 0x7F else null
-        runCatching {
-            l(
-                Record(
-                    source = pdu.source.address.toInt(),
-                    destination = pdu.destination.address.toInt(),
-                    sequence = pdu.sequence.toLong(),
-                    ivIndex = pdu.ivIndex.toLong(),
-                    ttl = pdu.ttl.toInt(),
-                    heartbeatInitTtl = hbInitTtl,
-                )
-            )
-        }
+        return Record(
+            source = pdu.source.address.toInt(),
+            destination = pdu.destination.address.toInt(),
+            sequence = pdu.sequence.toLong(),
+            ivIndex = pdu.ivIndex.toLong(),
+            ttl = pdu.ttl.toInt(),
+            heartbeatInitTtl = hbInitTtl,
+        )
     }
 
     /** 상위 계층까지 풀린 메시지 하나의 [opCode] (분할이면 재조립이 끝났을 때 한 번). */
