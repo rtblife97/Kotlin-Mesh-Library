@@ -421,6 +421,12 @@ internal class NetworkLayer(private val networkManager: NetworkManager) {
                             (index > (lastIvIndex.index + 1u)) &&
                                     !networkBeacon.ivIndex.isIvUpdateActive
                     }
+            } else {
+                // simdo-fork (2026-10-21) — 같은 상태(IV·IV Update 플래그 동일) 비콘은 전이가 아니다. 저장된 전이 시각과
+                // 복구 플래그를 그대로 둔다 (iOS 원본도 이 경우 timestamp·recovery 키를 쓰지 않는다). 종전에는 복호기가 만든
+                // IvIndex(transitionDate = 지금)를 그대로 저장해 전이 시각이 "마지막 비콘 시각" 이 됐고, 망의 X → X+1 IV Update 가
+                // canOverWrite 96 h 규칙에 걸려 버려졌다 — 노드가 정상 X+1 로 가면 약 96 h 동안 복호 불가.
+                meshNetwork.ivIndex = lastIvIndex
             }
             // Store the last IV Index
             secureProperties.storeIvIndex(uuid = meshNetwork.uuid, ivIndex = meshNetwork.ivIndex)
