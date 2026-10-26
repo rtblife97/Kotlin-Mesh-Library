@@ -6,6 +6,7 @@ import no.nordicsemi.kotlin.data.toByteArray
 import no.nordicsemi.kotlin.data.toHexString
 import no.nordicsemi.kotlin.mesh.core.model.Node
 import no.nordicsemi.kotlin.mesh.crypto.Crypto
+import java.util.IdentityHashMap
 
 /**
  * The Node Identity contains information from Node Identity or Private Node Identity beacon.
@@ -30,11 +31,17 @@ sealed interface NodeIdentity {
     /**
      * Returns the first Node that matches the identity from the given list.
      *
+     * simdo-fork (2026-10-26, #80) — 같은 IdentityKey 의 AES 키 스케줄을 이 호출 안에서 재사용한다 (종전: 노드마다
+     * `Cipher.getInstance`). 망 하나의 노드는 거의 모두 같은 NetKey 라 키 스케줄은 보통 한 번이다. 결과는 종전과 같다.
+     *
      * @param nodes List of Nodes to be matched.
      * @return The first matching Node.
      */
-    fun matches(nodes: List<Node>) = nodes.firstOrNull { node ->
-        matches(node = node)
+    fun matches(nodes: List<Node>): Node? {
+        val hashers = IdentityHashMap<ByteArray, Crypto.IdentityHasher>()
+        return nodes.firstOrNull { node ->
+            matchesNode(node) { key -> hashers.getOrPut(key) { Crypto.IdentityHasher(key) } }
+        }
     }
 
     /**
@@ -66,22 +73,7 @@ data class PublicNodeIdentity internal constructor(
     override val random: ByteArray,
 ) : NodeIdentity {
 
-    override fun matches(node: Node): Boolean {
-        val data = ByteArray(6) { 0 } + random +
-                node.primaryUnicastAddress.address.toByteArray()
-        for (key in node.networkKeys) {
-            val calculatedHash =
-                Crypto.calculateHash(data = data, identityKey = key.derivatives.identityKey)
-            if (hash.contentEquals(calculatedHash))
-                return true
-
-            key.oldDerivatives?.identityKey?.let {
-                if (hash.contentEquals(Crypto.calculateHash(data = data, identityKey = it)))
-                    return true
-            }
-        }
-        return false
-    }
+    override fun matches(node: Node): Boolean = matchesNode(node) { Crypto.IdentityHasher(it) }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -113,21 +105,7 @@ data class PrivateNodeIdentity internal constructor(
     override val hash: ByteArray,
     override val random: ByteArray,
 ) : NodeIdentity {
-    override fun matches(node: Node): Boolean {
-        val data = ByteArray(5) { 0 } + random + node.primaryUnicastAddress.address.toByteArray()
-        for (key in node.networkKeys) {
-            val calculatedHash =
-                Crypto.calculateHash(data = data, identityKey = key.derivatives.identityKey)
-            if (hash.contentEquals(calculatedHash))
-                return true
-
-            key.oldDerivatives?.identityKey?.let {
-                if (hash.contentEquals(Crypto.calculateHash(data = data, identityKey = it)))
-                    return true
-            }
-        }
-        return false
-    }
+    override fun matches(node: Node): Boolean = matchesNode(node) { Crypto.IdentityHasher(it) }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -146,6 +124,33 @@ data class PrivateNodeIdentity internal constructor(
         result = 31 * result + random.contentHashCode()
         return result
     }
+}
+
+/**
+ * simdo-fork (2026-10-26, #80) — 해시 입력 16바이트.
+ *  - Node Identity: Padding(48비트 0) || Random || Address (Mesh Protocol 1.1 §7.2.2.2.3).
+ *  - Private Node Identity: Padding(40비트 0) || 0x03 || Random || Address (§7.2.2.2.4). 종전 코드는 0x03 을 빠뜨려 15바이트였고,
+ *    JCA ECB/NoPadding 이 블록 크기 오류로 예외를 던져 Private Node Identity 는 한 번도 맞춰지지 않았다. 공개 테스트 벡터로는
+ *    확인하지 못했다 (스펙 식 기준).
+ */
+private fun NodeIdentity.hashInput(node: Node): ByteArray {
+    val address = node.primaryUnicastAddress.address.toByteArray()
+    return when (this) {
+        is PublicNodeIdentity -> ByteArray(6) + random + address
+        is PrivateNodeIdentity -> ByteArray(5) + byteArrayOf(0x03) + random + address
+    }
+}
+
+/** [node] 가 아는 NetKey(와 키 갱신 중이면 옛 키) 의 IdentityKey 로 해시가 맞는가. [hasherFor] = IdentityKey → 계산기. */
+private inline fun NodeIdentity.matchesNode(node: Node, hasherFor: (ByteArray) -> Crypto.IdentityHasher): Boolean {
+    val data = hashInput(node)
+    for (key in node.networkKeys) {
+        if (hash.contentEquals(hasherFor(key.derivatives.identityKey).hash(data))) return true
+        key.oldDerivatives?.identityKey?.let { old ->
+            if (hash.contentEquals(hasherFor(old).hash(data))) return true
+        }
+    }
+    return false
 }
 
 /**

@@ -461,8 +461,32 @@ object Crypto {
      * @param identityKey  Identity key.
      * @return Function of the included random number and identity information.
      */
-    fun calculateHash(data: ByteArray, identityKey: ByteArray) =
-        calculateECB(data, identityKey).drop(n = 8).toByteArray()
+    fun calculateHash(data: ByteArray, identityKey: ByteArray): ByteArray =
+        // simdo-fork (2026-10-26, #80) — 16바이트(정상 입력)는 BouncyCastle 블록 하나로. 종전 JCA Cipher.getInstance 는 호출마다
+        // 공급자 조회라 무겁다. 다른 길이는 종전 경로 그대로 (ECB 결과에서 앞 8바이트를 버린다).
+        if (data.size == 16) IdentityHasher(identityKey).hash(data)
+        else calculateECB(data, identityKey).drop(n = 8).toByteArray()
+
+    /**
+     * simdo-fork (2026-10-26, #80) — Node Identity 해시 계산기: IdentityKey 하나로 AES 블록을 하나씩 암호화해 하위 64비트를 낸다.
+     *
+     * 키 스케줄을 한 번만 만들어 같은 키로 여러 노드를 대조할 때 쓴다 (망 하나의 노드는 거의 모두 같은 NetKey = 같은 IdentityKey).
+     * 종전 [calculateHash] 는 노드마다 JCA `Cipher.getInstance` 를 불러, 600노드 망에서 Node Identity 광고 1건 해석이 130~450 ms
+     * 걸렸다 (S21U, 2026-10-26 실측 — 그동안 노드 잠금을 쥐어 메시 송수신이 섰다).
+     *
+     * 스레드 안전하지 않다 (BouncyCastle 엔진·출력 버퍼 공유) — 해석 한 번 안에서 한 스레드만 쓰고 버린다.
+     */
+    class IdentityHasher(identityKey: ByteArray) {
+        private val engine: BlockCipher = AESEngine.newInstance().apply { init(true, KeyParameter(identityKey)) }
+        private val out = ByteArray(16)
+
+        /** e(IdentityKey, [data]) mod 2^64 (하위 8바이트). [data] 는 16바이트. */
+        fun hash(data: ByteArray): ByteArray {
+            if (data.size != 16) throw InvalidCipherTextException("Identity hash input must be 16 bytes, was ${data.size}")
+            engine.processBlock(data, 0, out, 0)
+            return out.copyOfRange(8, 16)
+        }
+    }
 
     /**
      * Calculates the 128-bit IdentityKey.

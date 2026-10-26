@@ -6,6 +6,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import no.nordicsemi.kotlin.mesh.core.NodeIdentityDiagnostics
 import no.nordicsemi.kotlin.mesh.core.SecurePropertiesStorage
 import no.nordicsemi.kotlin.mesh.core.exception.AddressAlreadyInUse
 import no.nordicsemi.kotlin.mesh.core.exception.AddressNotInAllocatedRanges
@@ -923,8 +924,18 @@ data class MeshNetwork internal constructor(
      * @return Node or null otherwise.
      */
     // simdo-fork (2026-06-08, P6) — getter 우회 + [nodesMonitor] 아래 [_nodes] 직접 find (위 [node] 참조).
-    fun node(nodeIdentity: NodeIdentity) =
-        synchronized(nodesMonitor) { _nodes.find { nodeIdentity.matches(it) } }
+    // simdo-fork (2026-10-26, #80) — 잠금 안에서는 노드 목록 스냅샷만, 해시 대조는 잠금 밖. 종전엔 nodesMonitor 를 쥔 채 노드마다
+    // AES(JCA Cipher.getInstance) 를 돌려 597노드에서 광고 1건 130~450 ms 동안 수신·송신의 노드 찾기([node] 주소·UUID 판)가 섰다
+    // (S21U ART `Long monitor contention`, 조명 2번째부터 메시지 750~1,000 ms). 대조는 같은 IdentityKey 의 키 스케줄을 재사용한다
+    // ([NodeIdentity.matches] 목록 판). 스냅샷 뒤 제거된 노드가 맞춰질 수 있는 것은 종전(제거 직후 해석)과 같은 정도다.
+    fun node(nodeIdentity: NodeIdentity): Node? {
+        val t0 = System.nanoTime()
+        val snapshot = nodes
+        val t1 = System.nanoTime()
+        return nodeIdentity.matches(snapshot).also {
+            NodeIdentityDiagnostics.record(matchNanos = System.nanoTime() - t1, lockNanos = t1 - t0)
+        }
+    }
 
     /**
      * simdo-fork (2026-06-08, Phase 3) — deserialize 직후 parent 참조 복원을 MeshNetwork 내부로 이동.
