@@ -3,7 +3,9 @@
 package no.nordicsemi.kotlin.mesh.core.model.serialization
 
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -12,7 +14,9 @@ import kotlinx.serialization.json.decodeFromStream
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import no.nordicsemi.kotlin.mesh.core.PersistenceDiagnostics
 import no.nordicsemi.kotlin.mesh.core.model.MeshNetwork
+import no.nordicsemi.kotlin.mesh.core.model.Node
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.NetworkConfiguration
 import java.io.ByteArrayInputStream
 
@@ -72,14 +76,131 @@ internal object MeshNetworkSerializer {
     // MeshNetwork.withNodesLock 으로 감싼다. autosave 스레드의 이 트래버설이 nodesMonitor-only [add]/[remove]
     // 구조 변이와 동시에 돌면 ConcurrentModificationException 이 나므로, _nodes 컨테이너의 단일 guardian 인
     // nodesMonitor 아래에서 직렬화한다(Partial 경로의 _nodes filter-reassign 도 같은 lock 으로 배타).
-    internal fun serialize(network: MeshNetwork, configuration: NetworkConfiguration) =
-        network.withNodesLock {
-            JsonObject(content = jsonSerializer.run {
-                encodeToJsonElement(value = buildMap<String, JsonElement> {
-                    put(KEY_SCHEMA, JsonPrimitive(value = schema))
-                    put(KEY_ID, JsonPrimitive(value = id))
-                    put(KEY_VERSION, JsonPrimitive(value = version))
-                }).jsonObject + encodeToJsonElement(network.apply(configuration)).jsonObject
-            })
+    //
+    // simdo-fork (2026-10-26, #80) — Full 은 잠금을 노드 단위로 쪼갠다. 종전엔 망 전체 인코딩(600노드 1.4 MB, 화면 끔 3.8 s)
+    // 내내 nodesMonitor 를 쥐어, 수신 PDU 마다 그 잠금으로 노드를 찾는 경로(Provisioner.node → MeshNetwork.node)가 그동안 멈췄다.
+    // 지금: (1) nodesMonitor 아래에서 노드 목록 스냅샷 + 나머지(껍데기: 키·프로비저너·그룹·장면·제외 목록) 인코딩, (2) 노드마다
+    // nodesMonitor 를 잡고 그 노드만 인코딩, (3) 잠금 밖에서 껍데기의 `nodes` 자리에 끼운다. 출력은 종전과 바이트 단위로 같다
+    // (MeshNetworkSerializerNodeSliceTest). CME 보호(P6 의 이유)는 그대로: `_nodes` 순회는 (1) 의 스냅샷 하나뿐이고 add/remove
+    // cascade 가 건드리는 컬렉션은 (1) 에서 같은 잠금 아래 인코딩한다. Partial 은 apply() 가 망 자체를 거르므로 종전 그대로 통째 잠근다.
+    internal fun serialize(network: MeshNetwork, configuration: NetworkConfiguration): JsonObject =
+        when (configuration) {
+            is NetworkConfiguration.Full -> {
+                val meter = LockHoldMeter()
+                val (nodes, shell) = meter.hold { network.withNodesLock { captureShell(network) } }
+                val encoded = nodes.map { node -> meter.hold { network.withNodesLock { encodeNode(node) } } }
+                PersistenceDiagnostics.recordSerializationLock(meter.totalNanos, meter.maxNanos)
+                assemble(shell = shell, nodes = encoded)
+            }
+
+            is NetworkConfiguration.Partial -> network.withNodesLock {
+                JsonObject(content = jsonSerializer.run {
+                    header() + encodeToJsonElement(network.apply(configuration)).jsonObject
+                })
+            }
         }
+
+    /**
+     * simdo-fork (2026-10-26, #80) — 망 전체(Full)를 CDB 잠금([MeshNetwork.cdbMutex]) 을 노드 단위로 잡으며 직렬화한다. 저장(save)용.
+     *
+     * 종전 저장은 `withCdbLock { export() }` 로 인코딩 내내 cdbMutex 를 쥐었다 — 그동안 Config Status 반영(AccessLayer, cdbMutex 안)이
+     * 하위 전송 잠금 안에서 줄을 서 수신 전체가 멈췄다 (화면 끔 3.8 s, 10 s 주기 응답 틈 4.0 s, 2026-10-26 실측). 지금은
+     * 껍데기(노드 목록 스냅샷 포함)를 cdbMutex + nodesMonitor 아래 한 번, 노드는 하나씩 cdbMutex 아래에서 인코딩한다. 노드 사이에
+     * 기다리던 수신 처리가 들어온다 (코루틴 Mutex 는 줄 선 순서대로 넘겨준다).
+     *
+     * 노드 인코딩 구간에 nodesMonitor 는 잡지 않는다: 노드 내부를 바꾸는 라이브러리 경로(설정 응답 반영·NPPI 종결·프로비저닝 add)는
+     * 전부 cdbMutex 안이고, nodesMonitor 만 잡는 add/remove 는 노드 내부(직렬화 필드)를 바꾸지 않는다. 그래서 수신 PDU 의 노드 찾기는
+     * 노드 인코딩 중에도 기다리지 않는다.
+     *
+     * 일관성: 파일 하나 안의 노드들은 서로 다른 순간(이 직렬화가 걸리는 시간 안)의 상태일 수 있다. 노드 하나는 한 순간의 상태다.
+     * 그 사이 바뀐 것은 더러움 표시(markNetworkDirty)나 앱의 명시 save() 로 다음 저장에 들어간다 — "파일이 메모리보다 뒤처지는 창"
+     * 은 종전과 같이 합침 저장 상한(saveMaxDelay)으로 묶인다.
+     *
+     * cdbMutex 는 비재진입이다 — 이미 쥔 채 부르면 교착한다.
+     */
+    internal suspend fun serializeWithCdbLock(network: MeshNetwork): JsonObject {
+        val meter = LockHoldMeter()
+        val (nodes, shell) = network.cdbMutex.withLock {
+            meter.hold { network.withNodesLock { captureShell(network) } }
+        }
+        val encoded = ArrayList<JsonElement>(nodes.size)
+        for (node in nodes) {
+            encoded += network.cdbMutex.withLock { meter.hold { encodeNode(node) } }
+        }
+        PersistenceDiagnostics.recordSerializationLock(meter.totalNanos, meter.maxNanos)
+        return assemble(shell = shell, nodes = encoded)
+    }
+
+    /**
+     * simdo-fork (2026-10-26, #80) — 노드 하나를 CDB 노드 JSON 으로. 전체 export 의 `nodes[]` 원소와 같다
+     * (MeshNetworkSerializerNodeSliceTest). 잠금은 호출자가 잡는다.
+     *
+     * 잠금 없이 노드 내부를 바꾸는 앱 경로가 남아 있을 수 있어, 인코딩 중 리스트가 바뀌어 난 예외는 그 노드만 몇 번 다시 인코딩한다
+     * (노드 하나는 수 ms 라 다시 해도 싸다). 그래도 실패하면 예외를 그대로 올린다.
+     */
+    internal fun encodeNode(node: Node): JsonElement {
+        var last: RuntimeException? = null
+        repeat(NODE_ENCODE_ATTEMPTS) {
+            try {
+                return jsonSerializer.encodeToJsonElement(Node.serializer(), node)
+            } catch (e: ConcurrentModificationException) {
+                last = e
+            } catch (e: NoSuchElementException) {
+                last = e
+            } catch (e: IndexOutOfBoundsException) {
+                last = e
+            }
+        }
+        throw last!!
+    }
+
+    private const val NODE_ENCODE_ATTEMPTS = 3
+    private const val KEY_NODES = "nodes"
+
+    private fun header(): JsonObject = JsonObject(
+        linkedMapOf(
+            KEY_SCHEMA to JsonPrimitive(value = schema),
+            KEY_ID to JsonPrimitive(value = id),
+            KEY_VERSION to JsonPrimitive(value = version),
+        )
+    )
+
+    /** nodesMonitor 아래에서 부른다: 노드 목록 스냅샷 + `nodes` 를 빈 배열로 낸 망 인코딩. */
+    private fun captureShell(network: MeshNetwork): Pair<List<Node>, JsonObject> {
+        val nodes = network.nodes
+        val shell = NodeListFieldSerializer.withoutNodes {
+            jsonSerializer.encodeToJsonElement(network).jsonObject
+        }
+        return nodes to shell
+    }
+
+    /** 헤더 + 껍데기(키 순서 그대로) 에 `nodes` 자리만 노드별 인코딩으로 바꾼다. 잠금 밖. */
+    private fun assemble(shell: JsonObject, nodes: List<JsonElement>): JsonObject {
+        val content = LinkedHashMap<String, JsonElement>(shell.size + 3)
+        content.putAll(header())
+        for ((key, value) in shell) {
+            content[key] = if (key == KEY_NODES) JsonArray(nodes) else value
+        }
+        if (KEY_NODES !in shell) content[KEY_NODES] = JsonArray(nodes)
+        return JsonObject(content)
+    }
+
+    /** 직렬화가 잠금을 쥔 시간 (누적·한 번 최장). 한 직렬화 안에서 순서대로만 쓴다. */
+    private class LockHoldMeter {
+        var totalNanos = 0L
+            private set
+        var maxNanos = 0L
+            private set
+
+        inline fun <T> hold(block: () -> T): T {
+            val t0 = System.nanoTime()
+            try {
+                return block()
+            } finally {
+                val held = System.nanoTime() - t0
+                totalNanos += held
+                if (held > maxNanos) maxNanos = held
+            }
+        }
+    }
 }

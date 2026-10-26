@@ -29,6 +29,7 @@ import no.nordicsemi.kotlin.mesh.core.exception.ProvisionerAlreadyExists
 import no.nordicsemi.kotlin.mesh.core.exception.SceneAlreadyExists
 import no.nordicsemi.kotlin.mesh.core.exception.SceneInUse
 import no.nordicsemi.kotlin.mesh.core.messages.NodeProvisioningProtocolInterfaceProcedure
+import no.nordicsemi.kotlin.mesh.core.model.serialization.NodeListFieldSerializer
 import no.nordicsemi.kotlin.mesh.core.model.serialization.UuidSerializer
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.ApplicationKeysConfig
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.DeviceKeyConfig
@@ -97,6 +98,9 @@ data class MeshNetwork internal constructor(
     // Provisioner)에서의 raw 순회를 컴파일 에러로 차단 → guarded accessor([nodes] 스냅샷 / [node] / [withNodesLock])
     // 경유만 허용. (intra-class 접근은 private 라도 컴파일되므로 MeshNetwork.kt 내 apply()/serialize 보조 경로는
     // 그대로 — 이들은 deserialize/import 단일스레드 경로이며 hot writer 와 비동시.)
+    // simdo-fork (2026-10-26, #80) — 필드 직렬화기를 NodeListFieldSerializer 로. 읽기·쓰기는 기본 리스트 직렬화와 같고, 저장이 노드를
+    // 따로 인코딩하는 동안 껍데기만 만들 때 `nodes` 를 빈 배열로 낼 수 있게 한다 (MeshNetworkSerializer).
+    @Serializable(with = NodeListFieldSerializer::class)
     private var _nodes: MutableList<Node> = mutableListOf(),
     @SerialName("groups")
     internal var _groups: MutableList<Group> = mutableListOf(),

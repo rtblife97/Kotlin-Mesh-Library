@@ -52,6 +52,7 @@ import no.nordicsemi.kotlin.mesh.core.model.Node
 import no.nordicsemi.kotlin.mesh.core.model.Provisioner
 import no.nordicsemi.kotlin.mesh.core.model.UnicastAddress
 import no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer.deserialize
+import no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer
 import no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer.serialize
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.NetworkConfiguration
 import no.nordicsemi.kotlin.mesh.logger.LogCategory
@@ -460,7 +461,8 @@ class MeshNetworkManager(
     //   프로비저닝 완료, 앱 백그라운드, 망 교체·해제 전).
     // 재생 보호: RPL(SeqAuth)·송신 SEQ·IV Index 는 이 파일이 아니라 SecurePropertiesStorage(앱 = Room)에 메시지마다 따로 쓰인다.
     //   합침 창 안에서 앱이 죽어도 잃는 것은 CDB 의 노드 설정 표시뿐이고 재생 보호는 그대로다.
-    // 2026-06-05 cdbMutex: export 트래버설은 여전히 withCdbLock 안 (CME 방지). 2026-08-12 RPR 증폭 차단: RPR 은 여전히 더러움 표시조차
+    // 2026-06-05 cdbMutex: export 트래버설은 cdbMutex 안 (CME 방지) — 2026-10-26(#80)부터 노드 단위로 잡았다 놓는다
+    //   (MeshNetworkSerializer.serializeWithCdbLock). 2026-08-12 RPR 증폭 차단: RPR 은 여전히 더러움 표시조차
     //   하지 않는다 (AccessLayer 의 mutatesNetworkState() 판정 그대로).
 
     /** 마지막 변경 뒤 이만큼 조용하면 저장한다. */
@@ -531,12 +533,13 @@ class MeshNetworkManager(
                 // simdo-fork (2026-06-05) — Fork-3 CDB mutation race.
                 // export()=serialize 트래버설이 CDB mutable collection 을 순회한다.
                 // 병렬 config RX 가 동시에 write 중이면 CME → cdbMutex 로 트래버설을 직렬화.
-                // (cdbMutex 는 NetworkManager 소유; networkManager 미초기화 시 직렬 경로라 그냥 export.)
-                var exportNanos = 0L
-                val bytes = withCdbLock {
-                    val t0 = System.nanoTime()
-                    export().also { exportNanos = System.nanoTime() - t0 }
-                } ?: return@withLock false
+                // simdo-fork (2026-10-26, #80) — cdbMutex 를 인코딩 내내 쥐지 않고 노드 단위로 잡는다
+                // (MeshNetworkSerializer.serializeWithCdbLock). 종전 `withCdbLock { export() }` 는 600노드에서 저장 1회 = 수신 정지
+                // 0.7~3.8 s 였다. 문자열·바이트 변환은 잠금 밖. export_ms 는 노드 사이에 수신 처리를 기다린 시간을 포함한다.
+                val target = network ?: return@withLock false
+                val t0 = System.nanoTime()
+                val bytes = MeshNetworkSerializer.serializeWithCdbLock(target).toString().toByteArray()
+                val exportNanos = System.nanoTime() - t0
                 mutex.withLock { storage.save(network = bytes) }
                 PersistenceDiagnostics.recordSave(exportNanos)
                 true
@@ -715,6 +718,10 @@ class MeshNetworkManager(
      * Exports a mesh network to a JSON defined by the Mesh Configuration Database Profile based
      * on the given configuration.
      *
+     * simdo-fork (2026-10-26, #80) — Full 은 노드 잠금(nodesMonitor)을 노드 단위로 잡는다 (MeshNetworkSerializer.serialize).
+     * CDB 잠금(cdbMutex)은 잡지 않는다 (suspend 아님) — 설정 응답 반영과 겹치면 노드 하나가 반영 중간 상태로 나갈 수 있다. 그 경우의
+     * 리스트 변경 예외는 그 노드만 다시 인코딩한다. 일관된 노드 1대가 필요하면 [exportNode].
+     *
      * @param configuration Specifies if the network should be fully exported or partially.
      * @return Bytearray containing the Mesh network configuration.
      */
@@ -722,6 +729,31 @@ class MeshNetworkManager(
         ?.let { serialize(network = it, configuration = configuration) }
         ?.toString()
         ?.toByteArray()
+
+    /**
+     * simdo-fork (2026-10-26, #80) — 노드 1대만 CDB 노드 JSON 으로 내보낸다. 결과는 [export] 의 `nodes[]` 에서 그 노드를 꺼낸 것과
+     * 같다 (같은 직렬화기, MeshNetworkSerializerNodeSliceTest).
+     *
+     * 종전 앱은 노드 1대 JSON 이 필요할 때(서버 1008 노드 등록, WAL 노드 upsert) 망 전체를 export 해 그 노드를 골랐다 — 600노드면
+     * 1회 0.3~3.8 s 동안 잠금을 쥐었다. 여기서는 그 노드를 인코딩하는 동안만 CDB 잠금(cdbMutex)을 잡는다: 설정 응답 반영과 겹치지
+     * 않는 한 순간의 노드 상태다. cdbMutex 를 이미 쥔 채 부르지 말 것 (비재진입, 교착).
+     *
+     * @param uuid 노드 UUID.
+     * @return 노드 JSON (compact). 망이 없거나 그 노드가 없으면 null.
+     */
+    @OptIn(ExperimentalUuidApi::class)
+    suspend fun exportNode(uuid: Uuid): String? {
+        val target = network ?: return null
+        return target.cdbMutex.withLock {
+            target.node(uuid = uuid)?.let { node ->
+                val t0 = System.nanoTime()
+                MeshNetworkSerializer.encodeNode(node).also {
+                    val held = System.nanoTime() - t0
+                    PersistenceDiagnostics.recordSerializationLock(held, held)
+                }
+            }
+        }?.toString()
+    }
 
     override fun publish(message: UnacknowledgedMeshMessage, model: Model) {
         networkManager?.let {
