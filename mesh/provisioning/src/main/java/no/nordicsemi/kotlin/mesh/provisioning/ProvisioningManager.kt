@@ -3,6 +3,7 @@
 package no.nordicsemi.kotlin.mesh.provisioning
 
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -382,16 +383,12 @@ class ProvisioningManager(
             val data = ProvisioningRequest.Data(
                 encryptedDataWithMic = provisioningData.encryptedProvisioningDataWithMic
             )
-            logger?.v(LogCategory.PROVISIONING) { "Sending $data" }
-            send(request = data)
 
-            // simdo-fork (2026-10-05) — Provisioning Data 가 **전달된 뒤**(베어러 send 가 돌아옴: PB-ADV 는 상대 Transaction Ack)
-            // 기기는 키·주소를 이미 가졌다. 여기서 Complete 를 못 받고 흐름이 끝나면(시간 초과·링크 닫힘) 종전에는 장치 키를 버려
-            // 기기가 "우리 망에 등록됐지만 아무도 설정·초기화할 수 없는" 고아가 됐다 (실기기 2026-10-05: 폰이 포기한 0.1 s 뒤 Complete).
-            // 노드를 지금 만들어 [deliveredNode] 로 내놓는다 — 호출자가 실패 처리에서 [commitDeliveredNode] 로 살린다.
-            // NPPI(기존 노드 갱신) 는 제외: 실패해도 옛 키로 닿는다.
-            if (nodeProvisioningProtocolInterfaceTarget == null) {
-                deliveredNode = Node(
+            // simdo-fork (2026-10-28, simdo #99) — Data 를 만든 순간 장치 키가 정해졌다. 노드를 **송신 전에** 만들고
+            // [beforeProvisioningData] 를 기다린다 (호출자가 장치 키를 디스크에 쓰는 자리 = 선기록). 송신 뒤에 쓰면 Data 송신 ~ 저장
+            // 사이에 프로세스가 죽을 때 고아가 된다. NPPI(기존 노드 갱신) 는 제외: 실패해도 옛 키로 닿는다.
+            val pendingNode = if (nodeProvisioningProtocolInterfaceTarget == null) {
+                Node(
                     name = unprovisionedDevice.name,
                     uuid = unprovisionedDevice.uuid,
                     deviceKey = provisioningData.deviceKey,
@@ -400,7 +397,37 @@ class ProvisioningManager(
                     assignedNetworkKey = configuration.networkKey,
                     security = provisioningData.security
                 )
+            } else {
+                null
             }
+            if (pendingNode != null) {
+                beforeProvisioningData?.let { hook ->
+                    try {
+                        hook(pendingNode)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        // 선기록에 실패하면 Data 를 보내지 않고 가입을 실패로 끝낸다. 여기서 멈추면 기기는 Data 를 받지 못해
+                        // 미할당으로 돌아가 다시 가입할 수 있다. 쓰기 실패 뒤 보내면 곧바로 고아 후보가 된다.
+                        logger?.e(LogCategory.PROVISIONING) {
+                            "beforeProvisioningData failed — Provisioning Data not sent: $e"
+                        }
+                        emit(value = ProvisioningState.Failed(error = WriteAheadFailed(cause = e)))
+                        return@flow
+                    }
+                }
+            }
+
+            logger?.v(LogCategory.PROVISIONING) { "Sending $data" }
+            send(request = data)
+
+            // simdo-fork (2026-10-05) — Provisioning Data 가 **전달된 뒤**(베어러 send 가 돌아옴: PB-ADV 는 상대 Transaction Ack)
+            // 기기는 키·주소를 이미 가졌다. 여기서 Complete 를 못 받고 흐름이 끝나면(시간 초과·링크 닫힘) 종전에는 장치 키를 버려
+            // 기기가 "우리 망에 등록됐지만 아무도 설정·초기화할 수 없는" 고아가 됐다 (실기기 2026-10-05: 폰이 포기한 0.1 s 뒤 Complete).
+            // 노드를 [deliveredNode] 로 내놓는다 — 호출자가 실패 처리에서 [commitDeliveredNode] 로 살린다.
+            // 2026-10-28 — 송신 전에 만든 노드를 send 가 **정상 반환한 뒤에만** 올린다. send 가 던졌으면 null 로 남아, 키를 못 받았을 수
+            // 있는 기기를 망에 넣는 오판을 막는다 (그 경우는 호출자의 선기록 + 복구 판정이 맡는다).
+            if (pendingNode != null) deliveredNode = pendingNode
 
             awaitComplete().also {
                 emit(value = ProvisioningState.Complete)
@@ -468,7 +495,22 @@ class ProvisioningManager(
     }
 
     /**
+     * simdo-fork (2026-10-28, simdo #99) — Provisioning Data **송신 직전** 훅 (선기록). 라이브러리가 장치 키를 계산하고 Data 를 만든
+     * 뒤, 송신 전에 망에 넣지 않은 노드(장치 키·주소·엘리먼트 수 포함)를 넘기고 **반환을 기다린 뒤** 송신한다. 호출자는 여기서 노드를
+     * 디스크에 쓰고(쓰기가 끝나야 반환) — 송신 ~ Complete 처리 사이에 프로세스가 죽어도 장치 키가 남는다.
+     *
+     * - 신규 장치만. NPPI(기존 노드 갱신) 에서는 부르지 않는다.
+     * - 넘긴 노드는 아직 망에 없다. 바꾸지 말 것 (같은 객체가 [deliveredNode] 가 된다). JSON 은 [no.nordicsemi.kotlin.mesh.core.MeshNetworkManager.encodeNode].
+     * - 훅이 던지면 Data 를 **보내지 않고** `ProvisioningState.Failed(WriteAheadFailed)` 로 끝낸다 — 기기는 장치 키를 받지 않아
+     *   미할당으로 돌아간다(다시 가입 가능). 쓰기 실패 뒤 보내면 곧바로 고아 후보가 되므로 안전한 쪽으로 실패한다. 취소는 그대로 전파된다.
+     * - 훅이 오래 걸리면 그만큼 Data 송신이 늦어진다 (기기 프로비저닝 타이머 60 s 안에서 끝낼 것).
+     */
+    @Volatile
+    var beforeProvisioningData: (suspend (Node) -> Unit)? = null
+
+    /**
      * simdo-fork (2026-10-05) — Provisioning Data 가 기기에 전달된 뒤의 노드 (장치 키 포함). Data 전에는 null.
+     * 2026-10-28 — 베어러 send 가 정상 반환해야 채워진다 (send 가 던지면 null).
      * Complete 를 받았으면 라이브러리가 이미 망에 넣었다([commitDeliveredNode] 는 no-op).
      */
     @Volatile

@@ -1682,6 +1682,20 @@ class MeshNetworkManager(
     }
 
     companion object {
+        /**
+         * simdo-fork (2026-10-28, simdo #99) — 망에 **아직 넣지 않은** 노드를 [exportNode] 와 같은 노드 JSON(CDB `nodes[]` 원소, 장치 키
+         * 포함) 으로. 쓰임: 프로비저닝 Data 송신 직전 선기록 ([no.nordicsemi.kotlin.mesh.provisioning.ProvisioningManager.beforeProvisioningData]).
+         * 같은 직렬화기라 그 노드가 망에 들어간 뒤 [exportNode] 출력과 같다 (BeforeProvisioningDataHookTest). 되살리기는 [decodeNode].
+         * 잠금을 잡지 않는다 — 망 밖 노드 전용. 망 안 노드는 [exportNode].
+         */
+        fun encodeNode(node: Node): String = MeshNetworkSerializer.encodeNode(node).toString()
+
+        /**
+         * simdo-fork (2026-10-28) — [encodeNode]·[exportNode] 가 낸 노드 JSON 을 노드로. 모르는 키는 무시한다. 망에 넣는 것은 호출자
+         * (`MeshNetwork.add(node)`).
+         */
+        fun decodeNode(json: String): Node = MeshNetworkSerializer.decodeNode(json)
+
         /** simdo-fork (2026-10-15) — 합침 저장 기본값: 마지막 변경 뒤 조용한 시간. */
         val DEFAULT_SAVE_DEBOUNCE: Duration = 2.seconds
 

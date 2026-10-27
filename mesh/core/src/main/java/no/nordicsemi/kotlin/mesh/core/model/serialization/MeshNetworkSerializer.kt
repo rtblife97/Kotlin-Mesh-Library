@@ -154,6 +154,12 @@ internal object MeshNetworkSerializer {
         throw last!!
     }
 
+    /**
+     * simdo-fork (2026-10-28, simdo #99) — [encodeNode] 출력(노드 JSON 문자열) 을 노드로. 같은 직렬화기 설정(모르는 키 무시).
+     * 망 부모 연결은 `MeshNetwork.add(node)` 가 한다.
+     */
+    internal fun decodeNode(json: String): Node = jsonSerializer.decodeFromString(Node.serializer(), json)
+
     private const val NODE_ENCODE_ATTEMPTS = 3
     private const val KEY_NODES = "nodes"
 

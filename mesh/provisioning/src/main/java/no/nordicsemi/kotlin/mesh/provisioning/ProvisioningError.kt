@@ -102,3 +102,13 @@ data class InvalidNodeProvisioningProtocolInterfaceState(
     override val message: String
         get() = reason
 }
+
+/**
+ * simdo-fork (2026-10-28, simdo #99) — Provisioning Data 송신 직전 선기록([ProvisioningManager.beforeProvisioningData]) 이 실패했다.
+ * Data 는 보내지 않았다 — 기기는 장치 키를 받지 않았고, 링크가 닫히면 미할당으로 돌아간다(다시 가입 가능).
+ *
+ * @param cause 훅이 던진 예외.
+ */
+class WriteAheadFailed(override val cause: Throwable) : ProvisioningError() {
+    override val message: String get() = "write-ahead failed, Provisioning Data not sent: ${cause.message ?: cause.javaClass.simpleName}"
+}
