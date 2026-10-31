@@ -149,7 +149,7 @@ class Model internal constructor(
         get() = _publish
         internal set(value) {
             _publish = value
-            parentElement?.parentNode?.network?.updateTimestamp()
+            parentElement?.parentNode?.let { node -> node.network?.nodeChanged(node) }
         }
     val bind: List<KeyIndex>
         get() = _bind
@@ -568,7 +568,7 @@ class Model internal constructor(
      */
     internal fun bind(index: KeyIndex) = when (bind.contains(element = index)) {
         true -> false
-        else -> _bind.add(index)
+        else -> _bind.add(index).also { markNodeChanged() }
     }
 
     /**
@@ -579,6 +579,7 @@ class Model internal constructor(
      */
     internal fun bind(indexes: List<KeyIndex>) {
         _bind = indexes.toMutableList()
+        markNodeChanged()
     }
 
     /**
@@ -591,6 +592,7 @@ class Model internal constructor(
     internal fun unbind(index: KeyIndex) = when (bind.contains(element = index)) {
         true -> _bind.remove(element = index).also {
             if (publish?.index == index) _publish = null
+            markNodeChanged()
         }
 
         else -> false
@@ -611,6 +613,7 @@ class Model internal constructor(
      */
     internal fun set(publish: Publish?) {
         this._publish = publish
+        markNodeChanged()
     }
 
     /**
@@ -618,6 +621,7 @@ class Model internal constructor(
      */
     internal fun clearPublication() {
         _publish = null
+        markNodeChanged()
     }
 
     /**
@@ -629,6 +633,12 @@ class Model internal constructor(
         _bind = model._bind
         _publish = model._publish
         _subscribe = model._subscribe
+        markNodeChanged()
+    }
+
+    /** simdo-fork (2026-10-31) — 이 모델이 속한 노드가 바뀌었다 (노드 단위 증분 저장 기록). 노드에 안 붙은 모델이면 아무것도 안 한다. */
+    private fun markNodeChanged() {
+        parentElement?.parentNode?.let { node -> node.network?.nodeChanged(node) }
     }
 
     /**
@@ -666,7 +676,7 @@ class Model internal constructor(
             true -> false
             false -> {
                 _subscribe.add(address)
-                parentElement?.parentNode?.network?.updateTimestamp()
+                parentElement?.parentNode?.let { node -> node.network?.nodeChanged(node) }
                 true
             }
         }
@@ -700,7 +710,7 @@ class Model internal constructor(
             .takeIf { it > -1 }
             ?.let {
                 _subscribe.removeAt(index = it)
-                parentElement?.parentNode?.network?.updateTimestamp()
+                parentElement?.parentNode?.let { node -> node.network?.nodeChanged(node) }
             }
     }
 
@@ -709,7 +719,7 @@ class Model internal constructor(
      */
     fun unsubscribeFromAll() {
         _subscribe.clear()
-        parentElement?.parentNode?.network?.updateTimestamp()
+        parentElement?.parentNode?.let { node -> node.network?.nodeChanged(node) }
     }
 
     /**

@@ -18,7 +18,10 @@ import no.nordicsemi.kotlin.mesh.core.PersistenceDiagnostics
 import no.nordicsemi.kotlin.mesh.core.model.MeshNetwork
 import no.nordicsemi.kotlin.mesh.core.model.Node
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.NetworkConfiguration
+import java.io.BufferedWriter
 import java.io.ByteArrayInputStream
+import java.io.OutputStream
+import java.io.OutputStreamWriter
 
 internal object MeshNetworkSerializer {
 
@@ -42,28 +45,44 @@ internal object MeshNetworkSerializer {
      *
      * @param array in to a mesh network.
      */
+    // simdo-fork (2026-10-31) — 망 전체 JsonElement 트리를 만들지 않고 디코드한다. 종전은 바이트 → 트리(출력의 약 15배, 6,550노드
+    // 15 MB → 224 MB) → 모델 순서라 올리기 1회 할당이 513 MB 였다 (CdbScaleBenchTest). 지금: (1) 헤더(`$schema`·`version`) 만 담는 작은
+    // 클래스로 한 번 훑고(나머지 키는 ignoreUnknownKeys 로 건너뜀, 트리 없음) 검사, (2) 같은 바이트를 모델로 바로 디코드. 검사·결과는
+    // 종전과 같다 (MeshNetworkSerializerNodeSliceTest 가 종전 경로와 비교).
+    @kotlinx.serialization.Serializable
+    private class CdbHeader(
+        @kotlinx.serialization.SerialName(KEY_SCHEMA) val schema: JsonElement? = null,
+        @kotlinx.serialization.SerialName(KEY_VERSION) val version: JsonElement? = null,
+    )
+
     @OptIn(ExperimentalSerializationApi::class)
     internal fun deserialize(array: ByteArray) = jsonSerializer.run {
-        val networkElement: JsonElement = decodeFromStream(ByteArrayInputStream(array)
-            .also { stream -> stream.close() })
-        // Validates the json with the required properties.
-        networkElement.jsonObject.let { networkObject ->
-            require(schema == networkObject[KEY_SCHEMA]?.jsonPrimitive?.content) {
-                "Invalid Json schema!"
-            }
-            // ID does not need checking as it has changed in the past and may change again.
-            // require(id == networkObject[KEY_ID]?.jsonPrimitive?.content) { "Invalid Json id!" }
-            require(
-                networkObject[KEY_VERSION]?.jsonPrimitive?.content?.matches(VERSION_PATTERN)
-                    ?: false
-            ) { "Invalid version!" }
+        val header = decodeFromStream(CdbHeader.serializer(), ByteArrayInputStream(array))
+        // Validates the json with the required properties. (종전과 같은 판정: 원시값이 아니면 jsonPrimitive 가 예외.)
+        require(schema == header.schema?.jsonPrimitive?.content) {
+            "Invalid Json schema!"
         }
-        decodeFromJsonElement<MeshNetwork>(networkElement).apply {
+        // ID does not need checking as it has changed in the past and may change again.
+        require(header.version?.jsonPrimitive?.content?.matches(VERSION_PATTERN) ?: false) { "Invalid version!" }
+        decodeFromStream(MeshNetwork.serializer(), ByteArrayInputStream(array)).apply {
             // simdo-fork (2026-06-08, Phase 3) — parent 참조 복원을 MeshNetwork.rewireAfterDeserialize() 로 이동.
             // `_nodes` private 봉인으로 serializer 의 raw 순회가 컴파일 불가 → MeshNetwork 멤버(intra-class)로 위임.
             // 의미 동일(network 링크/elements·models parent 재설정).
             rewireAfterDeserialize()
         }
+    }
+
+    /** simdo-fork (2026-10-31) — 종전 디코드 (트리 경유). 시험에서 새 디코드와 결과를 비교하는 데만 쓴다. */
+    @OptIn(ExperimentalSerializationApi::class)
+    internal fun deserializeViaTree(array: ByteArray) = jsonSerializer.run {
+        val networkElement: JsonElement = decodeFromStream(ByteArrayInputStream(array))
+        networkElement.jsonObject.let { networkObject ->
+            require(schema == networkObject[KEY_SCHEMA]?.jsonPrimitive?.content) { "Invalid Json schema!" }
+            require(
+                networkObject[KEY_VERSION]?.jsonPrimitive?.content?.matches(VERSION_PATTERN) ?: false
+            ) { "Invalid version!" }
+        }
+        decodeFromJsonElement<MeshNetwork>(networkElement).apply { rewireAfterDeserialize() }
     }
 
     /**
@@ -129,6 +148,145 @@ internal object MeshNetworkSerializer {
         }
         PersistenceDiagnostics.recordSerializationLock(meter.totalNanos, meter.maxNanos)
         return assemble(shell = shell, nodes = encoded)
+    }
+
+    /**
+     * simdo-fork (2026-10-31) — [serializeWithCdbLock] 과 같은 바이트를 [out] 에 UTF-8 로 바로 쓴다. 저장(save)용.
+     *
+     * 종전 저장은 망 전체를 JsonElement 트리로 만든 뒤 문자열 → 바이트 배열로 바꿔 넘겼다. 노드 수에 비례하는 큰 덩어리 셋이 한꺼번에
+     * 살아 있었다 (JVM 벤치 3,000노드: 저장 1회 할당 ≈ 출력의 수십 배, 트리만 수십 MB — `CdbScaleBenchTest`). 폰 힙 한도 가까이에서
+     * 이 순간 할당이 OOM·GC 정지를 만든다 (2026-10-30 Flip7 1,400노드 OOM). 여기서는 노드를 하나씩 문자열로 인코딩해 곧바로 흘려 보낸다:
+     * 순간 할당은 노드 1대분 + 쓰기 버퍼뿐이다.
+     *
+     * 잠금은 [serializeWithCdbLock] 과 같다: 껍데기 = cdbMutex + nodesMonitor 아래 한 번, 노드 = 하나씩 cdbMutex 아래. 쓰기(파일 IO)는
+     * 잠금 밖이다. [out] 은 닫지 않는다 (호출자 몫). 도중에 예외가 나면 [out] 에는 잘린 JSON 이 남는다 — 호출자는 그 출력을 버려야 한다
+     * (앱 저장소 = 임시 파일에 쓰고 끝까지 썼을 때만 이름 바꿈).
+     *
+     * cdbMutex 는 비재진입이다 — 이미 쥔 채 부르면 교착한다.
+     */
+    internal suspend fun writeWithCdbLock(network: MeshNetwork, out: OutputStream) {
+        val meter = LockHoldMeter()
+        val (nodes, shell) = network.cdbMutex.withLock {
+            meter.hold { network.withNodesLock { captureShell(network) } }
+        }
+        writeAssembled(out = out, shell = shell, nodes = nodes) { node ->
+            network.cdbMutex.withLock { meter.hold { encodeNodeToString(node) } }
+        }
+        PersistenceDiagnostics.recordSerializationLock(meter.totalNanos, meter.maxNanos)
+    }
+
+    /**
+     * simdo-fork (2026-10-31) — [serialize] (Full) 와 같은 바이트를 [out] 에 바로 쓴다. 잠금은 [serialize] 와 같다 (nodesMonitor 를 노드
+     * 단위로, cdbMutex 없음). 비 suspend export 용.
+     */
+    internal fun writeFull(network: MeshNetwork, out: OutputStream) {
+        val meter = LockHoldMeter()
+        val (nodes, shell) = meter.hold { network.withNodesLock { captureShell(network) } }
+        writeAssembled(out = out, shell = shell, nodes = nodes) { node ->
+            meter.hold { network.withNodesLock { encodeNodeToString(node) } }
+        }
+        PersistenceDiagnostics.recordSerializationLock(meter.totalNanos, meter.maxNanos)
+    }
+
+    /**
+     * [assemble] 결과의 `toString()` 과 같은 문자를 [out] 에 쓴다: 헤더 + 껍데기(키 순서 그대로), `nodes` 자리는 [encode] 로 노드마다.
+     * 인라인이라 [encode] 안에서 suspend 잠금을 잡을 수 있다. 노드 인코딩([encode], 잠금 안) 과 쓰기(잠금 밖) 를 번갈아 한다.
+     */
+    private inline fun writeAssembled(
+        out: OutputStream,
+        shell: JsonObject,
+        nodes: List<Node>,
+        encode: (Node) -> String,
+    ) {
+        val writer = BufferedWriter(OutputStreamWriter(out, Charsets.UTF_8), WRITE_BUFFER_CHARS)
+        writer.write('{'.code)
+        var firstKey = true
+        for ((key, value) in layout(shell)) {
+            if (!firstKey) writer.write(','.code)
+            firstKey = false
+            // 키는 JsonObject.toString 과 같은 따옴표·이스케이프로.
+            writer.write(JsonPrimitive(key).toString())
+            writer.write(':'.code)
+            if (value === NODES_SLOT) {
+                writer.write('['.code)
+                for ((i, node) in nodes.withIndex()) {
+                    val json = encode(node)
+                    if (i > 0) writer.write(','.code)
+                    writer.write(json)
+                }
+                writer.write(']'.code)
+            } else {
+                writer.write(value.toString())
+            }
+        }
+        writer.write('}'.code)
+        writer.flush()
+    }
+
+    /** simdo-fork (2026-10-31) — 저널용: nodesMonitor 아래에서 부른다 (노드 목록 스냅숏 + 노드 없는 껍데기). */
+    internal fun captureShellForJournal(network: MeshNetwork): Pair<List<Node>, JsonObject> = captureShell(network)
+
+    /**
+     * simdo-fork (2026-10-31) — 전체 출력([writeAssembled]) 을 `nodes` 배열 안쪽에서 둘로 가른다: 앞 = `"nodes":[` 까지, 뒤 = `]` 부터.
+     * 앞 + 노드 JSON 들을 쉼표로 이은 것 + 뒤 = 전체 출력 (CdbJournal 이 이렇게 다시 짠다).
+     */
+    internal fun shellParts(shell: JsonObject): Pair<String, String> {
+        val prefix = StringBuilder(4 * 1024)
+        val suffix = StringBuilder(4 * 1024)
+        var current = prefix
+        current.append('{')
+        var firstKey = true
+        for ((key, value) in layout(shell)) {
+            if (!firstKey) current.append(',')
+            firstKey = false
+            current.append(JsonPrimitive(key).toString())
+            current.append(':')
+            if (value === NODES_SLOT) {
+                current.append('[')
+                current = suffix
+                current.append(']')
+            } else {
+                current.append(value.toString())
+            }
+        }
+        current.append('}')
+        return prefix.toString() to suffix.toString()
+    }
+
+    /** [assemble] 과 같은 키 순서. `nodes` 자리는 [NODES_SLOT]. */
+    private fun layout(shell: JsonObject): Map<String, JsonElement> {
+        val content = LinkedHashMap<String, JsonElement>(shell.size + 3)
+        content.putAll(header())
+        for ((key, value) in shell) {
+            content[key] = if (key == KEY_NODES) NODES_SLOT else value
+        }
+        if (KEY_NODES !in shell) content[KEY_NODES] = NODES_SLOT
+        return content
+    }
+
+    /** `nodes` 자리 표시 (동일성으로만 비교한다). */
+    private val NODES_SLOT: JsonElement = JsonArray(emptyList())
+
+    private const val WRITE_BUFFER_CHARS = 32 * 1024
+
+    /**
+     * simdo-fork (2026-10-31) — [encodeNode] 의 `toString()` 과 같은 문자열을 트리 없이 바로 인코딩한다 (kotlinx 스트리밍 인코더, 같은
+     * 설정). 같은 결과임은 `MeshNetworkSerializerNodeSliceTest` 가 잠근다. 예외 재시도도 [encodeNode] 와 같다.
+     */
+    internal fun encodeNodeToString(node: Node): String {
+        var last: RuntimeException? = null
+        repeat(NODE_ENCODE_ATTEMPTS) {
+            try {
+                return jsonSerializer.encodeToString(Node.serializer(), node)
+            } catch (e: ConcurrentModificationException) {
+                last = e
+            } catch (e: NoSuchElementException) {
+                last = e
+            } catch (e: IndexOutOfBoundsException) {
+                last = e
+            }
+        }
+        throw last!!
     }
 
     /**

@@ -76,6 +76,113 @@ class MeshNetworkSerializerNodeSliceTest {
         assertEquals(legacySerialize(big), MeshNetworkSerializer.serializeWithCdbLock(big).toString())
     }
 
+    /**
+     * 2026-10-31 — 저장·export 를 스트리밍(노드마다 바로 쓰기)으로 바꾼 뒤에도 파일 바이트가 종전과 같다. 저장 파일·서버 업로드·앱 후처리가
+     * 이 바이트를 읽으므로 형식이 한 글자도 바뀌면 안 된다. 시험용 CDB(노드 모양 여러 가지) + emblaze 조명 모양 + 한글 이름.
+     */
+    @Test
+    fun `스트리밍 저장·export 바이트 = 종전 바이트`() = runBlocking {
+        val shapes = listOf(fixture, synthesized(nodeCount = 40), EmblazeCdbFixture.network(nodeCount = 60), withKoreanNames(fixture))
+        for (cdb in shapes) {
+            val storage = NullStorage()
+            val mgr = manager(cdb = cdb, storage = storage)
+            val network = mgr.network!!
+            val legacy = legacySerialize(network).toByteArray()
+
+            val streamed = java.io.ByteArrayOutputStream().also { MeshNetworkSerializer.writeWithCdbLock(network, it) }.toByteArray()
+            assertEquals(String(legacy), String(streamed))
+            assertTrue(legacy.contentEquals(streamed))
+            assertTrue(legacy.contentEquals(mgr.export()!!))
+            // 저장 경로: 기본 saveStreaming(바이트로 모아 save) 으로 저장소에 들어간 바이트.
+            mgr.save()
+            assertTrue(legacy.contentEquals(storage.last.get()!!))
+            // 노드 하나 인코딩 = 트리 인코딩의 toString.
+            for (node in network.nodes) {
+                assertEquals(MeshNetworkSerializer.encodeNode(node).toString(), MeshNetworkSerializer.encodeNodeToString(node))
+            }
+        }
+    }
+
+    /**
+     * 2026-10-31 — 트리 없는 디코드(올리기·들여오기) = 종전 디코드(트리 경유). 같은 망이 나와야 한다 (다시 내보낸 바이트로 비교).
+     * 벤더 서버 형식 CDB 도 보려면 `MESH_VENDOR_CDB=<파일>` (저장소 밖 파일도 됨, 시험은 내용을 출력하지 않는다).
+     */
+    @Test
+    fun `트리 없는 디코드 = 종전 디코드`() {
+        val vendor = System.getenv("MESH_VENDOR_CDB")?.let { java.io.File(it).readBytes() }
+        val shapes = listOfNotNull(fixture, synthesized(nodeCount = 40), EmblazeCdbFixture.network(nodeCount = 60), withKoreanNames(fixture), vendor)
+        for (cdb in shapes) {
+            val streamed = MeshNetworkSerializer.deserialize(cdb)
+            val viaTree = MeshNetworkSerializer.deserializeViaTree(cdb)
+            assertEquals(legacySerialize(viaTree), legacySerialize(streamed))
+        }
+        // 검사도 같다: 스키마·판이 틀리면 둘 다 거부.
+        val badSchema = String(fixture).replaceFirst("http://json-schema.org/draft-04/schema#", "x").toByteArray()
+        val badVersion = String(fixture).replaceFirst("\"version\":\"1.0.0\"", "\"version\":\"1.0\"").replaceFirst("\"version\": \"1.0.0\"", "\"version\": \"1.0\"").toByteArray()
+        for (bad in listOf(badSchema, badVersion)) {
+            assertTrue(runCatching { MeshNetworkSerializer.deserialize(bad) }.isFailure)
+            assertTrue(runCatching { MeshNetworkSerializer.deserializeViaTree(bad) }.isFailure)
+        }
+    }
+
+    /**
+     * 2026-10-31 — 저장 1회의 순간 메모리가 출력 크기의 작은 배수로 묶인다. 종전(망 전체 트리 → 문자열 → 바이트)은 출력의 약 75배를 할당했고
+     * (1,400노드 243 MB) 폰 힙 한도 가까이에서 OOM 이 났다 (2026-10-30 Flip7). 할당 바이트는 HotSpot 스레드 계측값.
+     */
+    @Test
+    fun `저장 1회 할당이 출력의 수십 배를 넘지 않는다`() = runBlocking {
+        val threadMx = java.lang.management.ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        val storage = object : Storage {
+            var size = 0L
+            override suspend fun load(): ByteArray = ByteArray(0)
+            override suspend fun save(network: ByteArray) = Unit
+            override suspend fun saveStreaming(writer: suspend (java.io.OutputStream) -> Unit) {
+                val counting = object : java.io.OutputStream() {
+                    override fun write(b: Int) { size++ }
+                    override fun write(b: ByteArray, off: Int, len: Int) { size += len }
+                }
+                writer(counting)
+            }
+        }
+        val mgr = manager(cdb = EmblazeCdbFixture.network(nodeCount = 600), storage = storage)
+        mgr.save() // 예열 (클래스 적재)
+        storage.size = 0
+        val tid = Thread.currentThread().id
+        val before = threadMx.getThreadAllocatedBytes(tid)
+        mgr.save()
+        val allocated = threadMx.getThreadAllocatedBytes(tid) - before
+        val ratio = allocated.toDouble() / storage.size
+        assertTrue("저장 1회 할당 ${allocated / 1_000_000} MB / 출력 ${storage.size / 1000} KB = ${"%.1f".format(ratio)}배", ratio < 30)
+    }
+
+    /** 2026-10-31 — 쓰는 도중 저장소가 실패하면 저장은 실패로 끝나고 미저장 표시가 남는다 (다음 저장이 다시 쓴다). */
+    @Test
+    fun `스트리밍 저장 도중 실패 - 미저장 표시가 남는다`() = runBlocking {
+        val storage = object : Storage {
+            var fail = true
+            override suspend fun load(): ByteArray = ByteArray(0)
+            override suspend fun save(network: ByteArray) = Unit
+            override suspend fun saveStreaming(writer: suspend (java.io.OutputStream) -> Unit) {
+                val out = object : java.io.OutputStream() {
+                    var written = 0
+                    override fun write(b: Int) { write(byteArrayOf(b.toByte()), 0, 1) }
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        written += len
+                        if (fail && written > 4096) throw java.io.IOException("disk full (시험)")
+                    }
+                }
+                writer(out)
+            }
+        }
+        val mgr = manager(cdb = EmblazeCdbFixture.network(nodeCount = 50), storage = storage)
+        val failed = runCatching { mgr.save() }.exceptionOrNull()
+        assertTrue("저장 실패가 올라와야 한다", failed is java.io.IOException)
+        assertTrue("실패한 저장 뒤에도 미저장 표시", mgr.hasUnsavedChanges)
+        storage.fail = false
+        assertTrue(mgr.flushPendingSave())
+        assertTrue(!mgr.hasUnsavedChanges)
+    }
+
     @Test
     fun `노드 1대 export = 전체 export 의 그 노드`() = runBlocking {
         val mgr = manager(cdb = fixture)
@@ -168,6 +275,19 @@ class MeshNetworkSerializerNodeSliceTest {
         }
         val nodes = JsonArray(root["nodes"]!!.jsonArray + clones)
         return JsonObject(root.toMutableMap().apply { put("nodes", nodes) }).toString().toByteArray()
+    }
+
+    /** 망·그룹·노드 이름을 한글로 (UTF-8 다바이트·따옴표·역슬래시 이스케이프 포함). */
+    private fun withKoreanNames(cdb: ByteArray): ByteArray {
+        val root = Json.parseToJsonElement(String(cdb)).jsonObject
+        fun renamed(list: JsonElement, prefix: String) = JsonArray(list.jsonArray.mapIndexed { i, e ->
+            JsonObject(e.jsonObject.toMutableMap().apply { put("name", JsonPrimitive("$prefix $i \"따옴표\" \\ 끝")) })
+        })
+        return JsonObject(root.toMutableMap().apply {
+            put("meshName", JsonPrimitive("신동 광산 3층 현장"))
+            put("groups", renamed(root["groups"]!!, "구역"))
+            put("nodes", renamed(root["nodes"]!!, "조명"))
+        }).toString().toByteArray()
     }
 
     private fun manager(cdb: ByteArray, storage: Storage = NullStorage()): MeshNetworkManager =

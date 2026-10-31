@@ -24,6 +24,9 @@ object PersistenceDiagnostics {
     /** 실제로 끝난 저장 수 (단조 증가). */
     val saves = AtomicLong(0)
 
+    /** simdo-fork (2026-10-31) — 그중 망 전체를 쓴 저장 수 (저널 없는 저장소의 저장 전부 + 저널 스냅숏). 나머지는 노드 단위 증분. */
+    val fullSaves = AtomicLong(0)
+
     private val exportRing = Ring(CAPACITY)
     private val rxWaitRing = Ring(CAPACITY)
     private val lockTotalRing = Ring(CAPACITY)
@@ -35,6 +38,7 @@ object PersistenceDiagnostics {
         val exportSeq: Long,
         val rxWaitSeq: Long,
         val lockSeq: Long = 0,
+        val fullSaves: Long = 0,
     )
 
     /**
@@ -45,6 +49,7 @@ object PersistenceDiagnostics {
      * @property rxWaitMs  수신 메시지마다 하위 전송 진입 → 수신 흐름 내보내기 직전 (ms). [since] 의 `sources` 로 거른 것.
      * @property lockMs    직렬화마다 잠금을 쥔 누적 시간 (ms). 전역 (동시 설정·다른 경로의 export 포함).
      * @property lockMaxMs 직렬화마다 잠금을 한 번에 쥔 가장 긴 시간 (ms). 전역.
+     * @property fullSaves 그중 망 전체를 쓴 저장 수 (2026-10-31). saves - fullSaves = 노드 단위 증분 저장.
      */
     data class Window(
         val saves: Long,
@@ -52,9 +57,10 @@ object PersistenceDiagnostics {
         val rxWaitMs: List<Double>,
         val lockMs: List<Double> = emptyList(),
         val lockMaxMs: List<Double> = emptyList(),
+        val fullSaves: Long = 0,
     )
 
-    fun mark(): Mark = Mark(saves.get(), exportRing.seq(), rxWaitRing.seq(), lockTotalRing.seq())
+    fun mark(): Mark = Mark(saves.get(), exportRing.seq(), rxWaitRing.seq(), lockTotalRing.seq(), fullSaves.get())
 
     /** [mark] 이후 구간. [sources] 가 있으면 그 주소에서 온 수신 메시지만 센다 (동시 설정에서 다른 노드와 섞이지 않게). */
     fun since(mark: Mark, sources: ((Int) -> Boolean)? = null): Window = Window(
@@ -63,10 +69,12 @@ object PersistenceDiagnostics {
         rxWaitMs = rxWaitRing.since(mark.rxWaitSeq) { sources?.invoke(it) ?: true },
         lockMs = lockTotalRing.since(mark.lockSeq) { true },
         lockMaxMs = lockMaxRing.since(mark.lockSeq) { true },
+        fullSaves = fullSaves.get() - mark.fullSaves,
     )
 
-    internal fun recordSave(exportNanos: Long) {
+    internal fun recordSave(exportNanos: Long, full: Boolean = true) {
         saves.incrementAndGet()
+        if (full) fullSaves.incrementAndGet()
         exportRing.add(key = 0, nanos = exportNanos)
     }
 

@@ -133,7 +133,7 @@ data class Node internal constructor(
             require(value = value.isNotBlank()) { "Name cannot be empty!" }
             MeshNetwork.onChange(oldValue = _name, newValue = value) {
                 _name = value
-                network?.updateTimestamp()
+                network?.nodeChanged(this)
             }
         }
 
@@ -152,7 +152,7 @@ data class Node internal constructor(
     var configComplete: Boolean = false
         internal set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     /**
@@ -206,25 +206,25 @@ data class Node internal constructor(
     var secureNetworkBeacon: Boolean? = null
         internal set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     var networkTransmit: NetworkTransmit? = null
         internal set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     var relayRetransmit: RelayRetransmit? = null
         internal set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     var defaultTTL: UByte? = null
         internal set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     /**
@@ -259,21 +259,21 @@ data class Node internal constructor(
     var excluded: Boolean = false
         set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     @SerialName(value = "heartbeatPub")
     var heartbeatPublication: HeartbeatPublication? = null
         internal set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     @SerialName(value = "heartbeatSub")
     var heartbeatSubscription: HeartbeatSubscription? = null
         internal set(value) {
             field = value
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
 
     val primaryElement: Element
@@ -451,7 +451,7 @@ data class Node internal constructor(
             _netKeys.contains(this) -> false
             else -> {
                 _netKeys.add(this)
-                network?.updateTimestamp()
+                network?.nodeChanged(this@Node)
                 true
             }
         }
@@ -470,7 +470,7 @@ data class Node internal constructor(
             if (security is Insecure) {
                 it.networkKey(index = index)?.lowerSecurity()
             }
-            it.updateTimestamp()
+            it.nodeChanged(this@Node)
         }
     }
 
@@ -483,7 +483,7 @@ data class Node internal constructor(
         _netKeys.get(index)?.apply {
             update(true)
         }
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -506,7 +506,7 @@ data class Node internal constructor(
                 }
             // Remove the heartbeat publication, if set to use the removed network key.
             if (heartbeatPublication?.index == index) heartbeatPublication = null
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
     }
 
@@ -535,7 +535,7 @@ data class Node internal constructor(
         if (security is Insecure) {
             networkKeys.forEach { it.lowerSecurity() }
         }
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -546,7 +546,7 @@ data class Node internal constructor(
      */
     internal fun assignNetKeys(keys: List<NetworkKey>) {
         _netKeys = keys.map { NodeKey(it.index, false) }.toMutableList()
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -562,7 +562,7 @@ data class Node internal constructor(
         if (security is Insecure) {
             networkKeys.forEach { it.lowerSecurity() }
         }
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -587,7 +587,7 @@ data class Node internal constructor(
             true -> false
             false -> {
                 _appKeys.add(k)
-                network?.updateTimestamp()
+                network?.nodeChanged(this)
                 true
             }
         }
@@ -603,7 +603,7 @@ data class Node internal constructor(
         if (!_appKeys.has(index = index)) {
             _appKeys.add(NodeKey(index, false))
         }
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -614,7 +614,7 @@ data class Node internal constructor(
     internal fun updateAppKey(index: KeyIndex) {
         _appKeys.get(index)?.apply {
             update(true)
-            network?.updateTimestamp()
+            network?.nodeChanged(this@Node)
         }
     }
 
@@ -634,7 +634,7 @@ data class Node internal constructor(
                 .forEach { model ->
                     model.unbind(index)
                 }
-            network?.updateTimestamp()
+            network?.nodeChanged(this)
         }
     }
 
@@ -653,7 +653,7 @@ data class Node internal constructor(
         }.toMutableList()
         _appKeys.addAll(elements = appKeyIndexes.map { NodeKey(index = it, _updated = false) })
         _appKeys.sortBy { it.index }
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -677,7 +677,7 @@ data class Node internal constructor(
         _appKeys = keys.map { NodeKey(it, false) }
             .toMutableList()
             .apply { sortBy { it.index } }
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
 
@@ -760,7 +760,7 @@ data class Node internal constructor(
         while (_elements.size < count) {
             add(element = Element(location = Location.UNKNOWN))
         }
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -779,7 +779,7 @@ data class Node internal constructor(
         productIdentifier = null
         versionIdentifier = null
         replayProtectionCount = null
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -808,7 +808,7 @@ data class Node internal constructor(
 
         // And set the Elements received.
         set(page0.elements)
-        network?.updateTimestamp()
+        network?.nodeChanged(this)
     }
 
     /**
@@ -832,9 +832,7 @@ data class Node internal constructor(
      * @param address Unicast address.
      * @return true if the given address is in use by any of the elements
      */
-    fun containsElementWithAddress(address: Address) = elements.any {
-        it.unicastAddress.address == address
-    }
+    fun containsElementWithAddress(address: Address) = hasElementAt(address = address.toInt())
 
     /**
      * Checks if an element in the node uses this address.
@@ -853,8 +851,22 @@ data class Node internal constructor(
      * @param address Unicast address.
      * @return true if the given address is in use by any of the elements
      */
-    fun containsElementWithAddress(address: UnicastAddress) = elements.any {
-        it.unicastAddress == address
+    fun containsElementWithAddress(address: UnicastAddress) = hasElementAt(address = address.address.toInt())
+
+    /**
+     * simdo-fork (2026-10-31) — 엘리먼트 주소 = 노드 primary + 엘리먼트 index ([Element.unicastAddress]). 종전 비교는 엘리먼트마다
+     * 그 주소 객체를 새로 만들고(생성자 검사 포함) 비교했다 — 주소 → 노드 조회([MeshNetwork.node]) 가 수신·송신 PDU 마다 노드 전부를
+     * 훑으므로 조회 1회 = 노드 수 × 엘리먼트 수 할당이었다 (6,550노드 = 32,750). 같은 판정을 정수로 한다.
+     */
+    private fun hasElementAt(address: Int): Boolean {
+        val offset = address - _primaryUnicastAddress.address.toInt()
+        if (offset < 0) return false
+        // 반복자도 만들지 않는다 (ART 는 노드마다 반복자를 할당한다).
+        val elements = _elements
+        for (i in 0 until elements.size) {
+            if (elements[i].index == offset) return true
+        }
+        return false
     }
 
     /**

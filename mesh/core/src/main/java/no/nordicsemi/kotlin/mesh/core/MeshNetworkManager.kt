@@ -52,12 +52,14 @@ import no.nordicsemi.kotlin.mesh.core.model.Node
 import no.nordicsemi.kotlin.mesh.core.model.Provisioner
 import no.nordicsemi.kotlin.mesh.core.model.UnicastAddress
 import no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer.deserialize
+import no.nordicsemi.kotlin.mesh.core.model.serialization.CdbJournal
 import no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer
 import no.nordicsemi.kotlin.mesh.core.model.serialization.MeshNetworkSerializer.serialize
 import no.nordicsemi.kotlin.mesh.core.model.serialization.config.NetworkConfiguration
 import no.nordicsemi.kotlin.mesh.logger.LogCategory
 import no.nordicsemi.kotlin.mesh.logger.Logger
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.ExperimentalTime
 import kotlin.uuid.ExperimentalUuidApi
@@ -410,20 +412,30 @@ class MeshNetworkManager(
      * @return true if the configuration was successfully loaded or false otherwise.
      */
     @OptIn(ExperimentalUuidApi::class)
-    suspend fun load() = storage
-        .load()
-        .takeIf { it.isNotEmpty() }
-        ?.let {
-            // simdo-fork (2026-10-15) — 망 교체 전 미뤄 둔 저장 flush (합침 저장).
-            flushBeforeReplacing(reason = "load")
-            network = deserialize(it)
-                // Load the IvIndex from the secure properties' storage.
-                .apply { ivIndex = secureProperties.ivIndex(uuid = uuid) }
-            networkManager = NetworkManager(manager = this)
-            proxyFilter.onNewNetworkCreated()
-            _networkEvents.emit(NetworkEvent.NetworkUpdated)
-            true
-        } == true
+    suspend fun load(): Boolean {
+        // simdo-fork (2026-10-31) — 저장소가 저널을 쓰면(노드 단위 증분 저장) 저널을 접어 올린다. 저널이 없거나 비면 종전 파일.
+        // 망 교체 전 미뤄 둔 저장을 먼저 쓴다 (2026-10-15 합침 저장) — 읽은 뒤에 쓰면 방금 읽은 것보다 파일이 앞선다.
+        flushBeforeReplacing(reason = "load")
+        val journal = (storage as? JournalStorage)?.let { js ->
+            js.openJournal()?.use { CdbJournal.assemble(it) }
+        }
+        val bytes = journal ?: storage.load().takeIf { it.isNotEmpty() } ?: return false
+        network = deserialize(bytes)
+            // Load the IvIndex from the secure properties' storage.
+            .apply { ivIndex = secureProperties.ivIndex(uuid = uuid) }
+            .also {
+                // 저널로 올린 망 = 저장 파일과 같다 → 다음 저장은 증분. 종전 파일로 올렸으면 다음 저장이 저널 스냅숏을 처음 쓴다.
+                if (journal != null) {
+                    it.changeLog.markClean()
+                    lastSnapshotBytes = bytes.size.toLong()
+                    lastFullSaveAtNanos = System.nanoTime()
+                }
+            }
+        networkManager = NetworkManager(manager = this)
+        proxyFilter.onNewNetworkCreated()
+        _networkEvents.emit(NetworkEvent.NetworkUpdated)
+        return true
+    }
 
     /**
      * Saves the network in the local storage provided by the user.
@@ -470,6 +482,36 @@ class MeshNetworkManager(
 
     /** 변경이 계속 들어와도 첫 변경 뒤 이 안에는 저장한다. */
     var saveMaxDelay: Duration = DEFAULT_SAVE_MAX_DELAY
+
+    /**
+     * simdo-fork (2026-10-31) — 노드 단위 증분 저장([JournalStorage]): 마지막 전체 스냅숏 뒤 이만큼 지나면 다음 저장은 전체 스냅숏이다.
+     * 바뀐 노드 기록이 놓친 변경이 있어도 저장 파일이 이 안에서 따라잡는다 (6,550노드 폰 전체 저장 ≈ 0.7 s 추정 → 10분에 1회는 무시할 만).
+     */
+    var fullSaveMaxInterval: Duration = 10.minutes
+
+    /** simdo-fork (2026-10-31) — 스냅숏 뒤 덧붙인 양이 이 크기와 마지막 스냅숏 크기 중 큰 쪽을 넘으면 다음 저장은 전체 스냅숏(저널 압축)이다. */
+    var journalMinCompactionBytes: Long = 1L shl 20
+
+    private var lastSnapshotBytes = 0L
+    private var lastFullSaveAtNanos = 0L
+
+    /** 쓴 바이트 수를 센다 (저널 스냅숏 크기 = 압축 기준). */
+    private class CountingOutputStream(private val out: java.io.OutputStream) : java.io.OutputStream() {
+        var count = 0L
+            private set
+
+        override fun write(b: Int) {
+            out.write(b)
+            count++
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            count += len
+        }
+
+        override fun flush() = out.flush()
+    }
 
     private val dirtyLock = Any()
     private var dirty = false
@@ -536,12 +578,52 @@ class MeshNetworkManager(
                 // simdo-fork (2026-10-26, #80) — cdbMutex 를 인코딩 내내 쥐지 않고 노드 단위로 잡는다
                 // (MeshNetworkSerializer.serializeWithCdbLock). 종전 `withCdbLock { export() }` 는 600노드에서 저장 1회 = 수신 정지
                 // 0.7~3.8 s 였다. 문자열·바이트 변환은 잠금 밖. export_ms 는 노드 사이에 수신 처리를 기다린 시간을 포함한다.
+                // simdo-fork (2026-10-31) — 망 전체 JsonElement 트리 → 문자열 → 바이트 배열을 만들지 않고 저장소 스트림에 노드 하나씩 바로
+                // 쓴다 (Storage.saveStreaming). 종전 저장 1회 할당 = 출력의 약 75배 (JVM 벤치 1,400노드 243 MB, 3,000노드 519 MB — 그중
+                // 망 전체 트리가 한순간 39 / 83 MB 살아 있었다). 2026-10-30 Flip7 1,400노드에서 OOM. 출력 바이트는 종전과 같다.
+                // export_ms 는 이제 직렬화 + 저장소 쓰기(파일 IO) 시간이다 (둘이 번갈아 돈다). 종전은 직렬화만이었다.
                 val target = network ?: return@withLock false
                 val t0 = System.nanoTime()
-                val bytes = MeshNetworkSerializer.serializeWithCdbLock(target).toString().toByteArray()
-                val exportNanos = System.nanoTime() - t0
-                mutex.withLock { storage.save(network = bytes) }
-                PersistenceDiagnostics.recordSave(exportNanos)
+                var exportNanos = 0L
+                val journal = storage as? JournalStorage
+                if (journal == null) {
+                    mutex.withLock {
+                        storage.saveStreaming { out ->
+                            MeshNetworkSerializer.writeWithCdbLock(target, out)
+                            exportNanos = System.nanoTime() - t0
+                        }
+                    }
+                    PersistenceDiagnostics.recordSave(exportNanos, full = true)
+                } else {
+                    // simdo-fork (2026-10-31) — 노드 단위 증분 저장. 바뀐 노드 + 껍데기만 저널에 덧붙인다. 전체 스냅숏은 (1) 저장 파일이
+                    // 이 망을 대표하지 못할 때(새로 만들거나 들여온 망), (2) 저널이 스냅숏보다 커졌을 때, (3) 마지막 전체 저장 뒤
+                    // [fullSaveMaxInterval] 이 지났을 때 — (3) 은 바뀐 노드 기록이 놓친 변경이 있어도 파일이 그만큼 안에서 따라잡게 하는 안전망.
+                    val changes = target.changeLog.take()
+                    try {
+                        // 압축 기준 = 스냅숏 뒤 덧붙인 양 (저널 크기 − 스냅숏 크기) 이 스냅숏만큼 (최소 journalMinCompactionBytes).
+                        val compact = changes.full ||
+                            journal.journalSize() - lastSnapshotBytes >= maxOf(journalMinCompactionBytes, lastSnapshotBytes) ||
+                            System.nanoTime() - lastFullSaveAtNanos >= fullSaveMaxInterval.inWholeNanoseconds
+                        mutex.withLock {
+                            if (compact) {
+                                journal.replaceJournal { out ->
+                                    val counting = CountingOutputStream(out)
+                                    CdbJournal.writeSnapshot(target, counting)
+                                    lastSnapshotBytes = counting.count
+                                    exportNanos = System.nanoTime() - t0
+                                }
+                                lastFullSaveAtNanos = System.nanoTime()
+                            } else {
+                                journal.appendJournal(CdbJournal.encodeDelta(target, changes))
+                                exportNanos = System.nanoTime() - t0
+                            }
+                        }
+                        PersistenceDiagnostics.recordSave(exportNanos, full = compact)
+                    } catch (e: Throwable) {
+                        target.changeLog.restore(changes)
+                        throw e
+                    }
+                }
                 true
             } catch (e: Throwable) {
                 synchronized(dirtyLock) {
@@ -673,7 +755,13 @@ class MeshNetworkManager(
         synchronized(dirtyLock) { dirty = false }
         _networkEvents.emit(value = NetworkEvent.NetworkUpdated)
         // 진행 중인 옛 저장이 끝난 뒤 빈 파일을 쓴다 (persistLock) — 늦게 끝난 옛 저장이 해제를 되살리지 않게.
-        persistLock.withLock { mutex.withLock { storage.save(network = byteArrayOf()) } }
+        persistLock.withLock {
+            mutex.withLock {
+                storage.save(network = byteArrayOf())
+                // simdo-fork (2026-10-31) — 저널도 비운다 (빈 저널 = 망 없음 → 다음 load 는 종전 파일(빈) 을 본다).
+                (storage as? JournalStorage)?.replaceJournal { }
+            }
+        }
     }
 
     /**
@@ -725,10 +813,17 @@ class MeshNetworkManager(
      * @param configuration Specifies if the network should be fully exported or partially.
      * @return Bytearray containing the Mesh network configuration.
      */
-    fun export(configuration: NetworkConfiguration = NetworkConfiguration.Full) = network
-        ?.let { serialize(network = it, configuration = configuration) }
-        ?.toString()
-        ?.toByteArray()
+    fun export(configuration: NetworkConfiguration = NetworkConfiguration.Full): ByteArray? {
+        val target = network ?: return null
+        return when (configuration) {
+            // simdo-fork (2026-10-31) — Full 은 망 전체 트리·문자열 없이 바이트로 바로 (저장과 같은 스트리밍 직렬화, 출력 동일).
+            is NetworkConfiguration.Full -> java.io.ByteArrayOutputStream(64 * 1024)
+                .also { MeshNetworkSerializer.writeFull(target, it) }
+                .toByteArray()
+
+            else -> serialize(network = target, configuration = configuration).toString().toByteArray()
+        }
+    }
 
     /**
      * simdo-fork (2026-10-26, #80) — 노드 1대만 CDB 노드 JSON 으로 내보낸다. 결과는 [export] 의 `nodes[]` 에서 그 노드를 꺼낸 것과

@@ -308,6 +308,20 @@ data class MeshNetwork internal constructor(
     }
 
     /**
+     * simdo-fork (2026-10-31) — 노드 [node] 의 저장 대상 내용이 바뀌었다: timestamp 갱신 + 증분 저장 기록([changeLog]).
+     * 노드·엘리먼트·모델의 변경 자리는 [updateTimestamp] 대신 이것을 부른다.
+     */
+    @OptIn(ExperimentalUuidApi::class)
+    internal fun nodeChanged(node: Node) {
+        updateTimestamp()
+        changeLog.nodeChanged(node.uuid)
+    }
+
+    /** simdo-fork (2026-10-31) — 마지막 저장 뒤 바뀐 노드 (노드 단위 증분 저장). 직렬화하지 않는다. */
+    @Transient
+    internal val changeLog = NetworkChangeLog()
+
+    /**
      * Sets new value of IV Index and IV Update flag.
      *
      * This method allows setting the IV Index of the mesh network when the provisioner is not
@@ -998,7 +1012,7 @@ data class MeshNetwork internal constructor(
             throw DoesNotBelongToNetwork()
         }
         _nodes.add(node.also { it.network = this })
-        updateTimestamp()
+        nodeChanged(node)
     }
 
     /**
@@ -1037,6 +1051,7 @@ data class MeshNetwork internal constructor(
                 // clear its network reference.
                 node.network = null
                 updateTimestamp()
+                changeLog.nodeRemoved(node.uuid)
             }
         }
     }
@@ -1178,7 +1193,7 @@ data class MeshNetwork internal constructor(
             node.invalidateCompositionData()
         }
 
-        updateTimestamp()
+        nodeChanged(node)
     }
 
     /**

@@ -676,6 +676,13 @@ internal class AccessLayer(private val networkManager: NetworkManager) : AutoClo
                     // simdo-fork (2026-10-15) — 이 emit 은 이제 save() 가 아니라 "더러움" 표시다 (NetworkManager.emitNetworkManagerEvent →
                     // MeshNetworkManager.markNetworkDirty, 기다리지 않음). 저장은 합쳐서 수 초 안에 1회. 판정(RPR 제외)은 그대로다.
                     if (message.mutatesNetworkState()) {
+                        // simdo-fork (2026-10-31) — 노드 단위 증분 저장: 응답을 보낸 노드를 바뀐 노드로 적는다. 처리기 중에는 노드 필드를
+                        // 바꾸고 망 timestamp 만 갱신하는 곳이 있어(ConfigGattProxyStatus 의 features 등) 그 변경까지 덮는 안전망이다.
+                        // 처리 뒤에 적는다 — Node Reset 으로 지워진 노드는 다시 적히지 않는다.
+                        @OptIn(kotlin.uuid.ExperimentalUuidApi::class)
+                        networkManager.meshNetwork.let { network ->
+                            network.node(address = accessPdu.source)?.let { network.changeLog.nodeChanged(it.uuid) }
+                        }
                         networkManager.emitNetworkManagerEvent(event = NetworkManagerEvent.OnNetworkChanged)
                     }
                 } else {
