@@ -17,6 +17,12 @@ import java.io.OutputStream
  */
 interface JournalStorage {
 
+    /**
+     * 지금 저널을 쓰는가. false 면 라이브러리는 이 저장소를 저널 없는 [Storage] 로 다룬다 (전체 파일 저장·올리기, 종전과 같음).
+     * 같은 저장소 구현을 여러 앱이 쓸 때 앱마다 고르게 하려는 것이다 (simdo: 커미셔닝 앱만 켠다).
+     */
+    val journalEnabled: Boolean get() = true
+
     /** 저널을 읽을 스트림. 저널이 없으면 null. 호출자가 닫는다. */
     suspend fun openJournal(): InputStream?
 

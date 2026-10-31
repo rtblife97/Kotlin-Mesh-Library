@@ -189,6 +189,20 @@ class NodeJournalSaveTest {
         assertReloadEquals(mgr, storage)
     }
 
+    /** 2026-10-31 — 저널을 끈 저장소는 종전과 같다: 저장마다 전체 파일(save), 저널은 건드리지 않고, 올리기도 전체 파일에서. */
+    @Test
+    fun `저널을 끈 저장소 - 종전 전체 파일 저장`() = runBlocking {
+        val storage = MemoryJournalStorage(enabled = false)
+        val mgr = manager(EmblazeCdbFixture.network(nodeCount = 10), storage)
+        mgr.save()
+        mgr.network!!.nodes[1].name = "저널 꺼짐"
+        mgr.save()
+        assertEquals("저널은 비어 있다", 0L, storage.size())
+        assertEquals("전체 파일 저장 2회", 2, storage.fullFiles)
+        val reloaded = manager(null, storage).apply { assertTrue(load()) }
+        assertEquals(String(mgr.export()!!), String(reloaded.export()!!))
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private val provisionerAddress = 0x0001
@@ -215,12 +229,18 @@ class NodeJournalSaveTest {
     ).also { m -> if (cdb != null) runBlocking { m.import(cdb) } }
 
     /** 메모리 저널 저장소 (앱 MeshNetworkStorage 의 파일 저널과 같은 계약). */
-    private class MemoryJournalStorage : Storage, JournalStorage {
+    private class MemoryJournalStorage(private val enabled: Boolean = true) : Storage, JournalStorage {
         @Volatile private var journal: ByteArray? = null
+        @Volatile private var file: ByteArray = ByteArray(0)
+        @Volatile var fullFiles = 0
+        override val journalEnabled: Boolean get() = enabled
         fun size() = journal?.size?.toLong() ?: 0L
         fun truncate(to: Long) { journal = journal!!.copyOf(to.toInt()) }
-        override suspend fun load(): ByteArray = ByteArray(0)
-        override suspend fun save(network: ByteArray) = Unit
+        override suspend fun load(): ByteArray = file
+        override suspend fun save(network: ByteArray) {
+            file = network
+            if (network.isNotEmpty()) fullFiles++
+        }
         override suspend fun openJournal(): InputStream? = journal?.let { ByteArrayInputStream(it) }
         override suspend fun replaceJournal(writer: suspend (OutputStream) -> Unit) {
             val out = ByteArrayOutputStream()

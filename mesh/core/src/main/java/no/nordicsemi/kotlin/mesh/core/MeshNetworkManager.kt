@@ -416,7 +416,7 @@ class MeshNetworkManager(
         // simdo-fork (2026-10-31) — 저장소가 저널을 쓰면(노드 단위 증분 저장) 저널을 접어 올린다. 저널이 없거나 비면 종전 파일.
         // 망 교체 전 미뤄 둔 저장을 먼저 쓴다 (2026-10-15 합침 저장) — 읽은 뒤에 쓰면 방금 읽은 것보다 파일이 앞선다.
         flushBeforeReplacing(reason = "load")
-        val journal = (storage as? JournalStorage)?.let { js ->
+        val journal = journalStorage?.let { js ->
             js.openJournal()?.use { CdbJournal.assemble(it) }
         }
         val bytes = journal ?: storage.load().takeIf { it.isNotEmpty() } ?: return false
@@ -491,6 +491,10 @@ class MeshNetworkManager(
 
     /** simdo-fork (2026-10-31) — 스냅숏 뒤 덧붙인 양이 이 크기와 마지막 스냅숏 크기 중 큰 쪽을 넘으면 다음 저장은 전체 스냅숏(저널 압축)이다. */
     var journalMinCompactionBytes: Long = 1L shl 20
+
+    /** simdo-fork (2026-10-31) — 저널을 쓰는 저장소면 그것 ([JournalStorage.journalEnabled] 가 꺼져 있으면 null = 종전 전체 저장). */
+    private val journalStorage: JournalStorage?
+        get() = (storage as? JournalStorage)?.takeIf { it.journalEnabled }
 
     private var lastSnapshotBytes = 0L
     private var lastFullSaveAtNanos = 0L
@@ -585,7 +589,7 @@ class MeshNetworkManager(
                 val target = network ?: return@withLock false
                 val t0 = System.nanoTime()
                 var exportNanos = 0L
-                val journal = storage as? JournalStorage
+                val journal = journalStorage
                 if (journal == null) {
                     mutex.withLock {
                         storage.saveStreaming { out ->
@@ -759,7 +763,7 @@ class MeshNetworkManager(
             mutex.withLock {
                 storage.save(network = byteArrayOf())
                 // simdo-fork (2026-10-31) — 저널도 비운다 (빈 저널 = 망 없음 → 다음 load 는 종전 파일(빈) 을 본다).
-                (storage as? JournalStorage)?.replaceJournal { }
+                journalStorage?.replaceJournal { }
             }
         }
     }
